@@ -34,34 +34,41 @@ export class EventWorker {
     const event = claimed.rows[0];
     if (!event) return false;
     try {
-      channel.publish(
-        exchange,
-        event.event_type,
-        Buffer.from(
-          JSON.stringify({
-            event_id: event.id,
-            event_type: event.event_type,
-            event_version: event.event_version,
-            occurred_at: new Date(event.created_at).toISOString(),
-            producer: "parc-ledger",
-            tenant_id: event.tenant_id,
-            correlation_id: event.correlation_id ?? event.id,
-            causation_id: event.causation_id,
-            idempotency_key: event.idempotency_key ?? event.id,
-            aggregate_type: event.aggregate_type,
-            aggregate_id: event.aggregate_id,
-            aggregate_version: 1,
-            data_classification: "INTERNAL",
-            payload: event.payload,
-          }),
-        ),
-        {
-          persistent: true,
-          messageId: event.id,
-          contentType: "application/json",
-        },
-      );
-      await channel.waitForConfirms();
+      await new Promise<void>((resolve, reject) => {
+        channel.publish(
+          exchange,
+          event.event_type,
+          Buffer.from(
+            JSON.stringify({
+              event_id: event.id,
+              event_type: event.event_type,
+              event_version: event.event_version,
+              occurred_at: new Date(event.created_at).toISOString(),
+              producer: "parc-ledger",
+              tenant_id: event.tenant_id,
+              correlation_id: event.correlation_id ?? event.id,
+              causation_id: event.causation_id,
+              idempotency_key: event.idempotency_key ?? event.id,
+              aggregate_type: event.aggregate_type,
+              aggregate_id: event.aggregate_id,
+              aggregate_version: 1,
+              data_classification: "INTERNAL",
+              payload: event.payload,
+            }),
+          ),
+          {
+            persistent: true,
+            messageId: event.id,
+            contentType: "application/json",
+          },
+          (error) =>
+            error
+              ? reject(
+                  error instanceof Error ? error : new Error(String(error)),
+                )
+              : resolve(),
+        );
+      });
       const completed = await this.db.raw<{
         rows: Array<{ completed: boolean }>;
       }>("SELECT public.complete_ledger_outbox(?, ?, ?, ?) AS completed", [
@@ -133,7 +140,7 @@ function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value !== null && typeof value === "object") {
     return `{${Object.entries(value)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => Buffer.from(left).compare(Buffer.from(right)))
       .map(([key, nested]) => `${JSON.stringify(key)}:${stableJson(nested)}`)
       .join(",")}}`;
   }

@@ -3,7 +3,11 @@ export async function up(knex: Knex): Promise<void> {
   if (await knex.schema.hasTable("ledger_command_idempotency")) return;
   await knex.raw(`
     ALTER TABLE public.customer_ledger_accounts ALTER COLUMN user_id DROP NOT NULL;
-    ALTER TABLE public.ledger_tenant_accounts ADD COLUMN currency_code char(3) NOT NULL DEFAULT 'NGN' CHECK (currency_code ~ '^[A-Z]{3}$');
+    ALTER TABLE public.ledger_tenant_accounts ADD COLUMN currency_code char(3);
+    UPDATE public.ledger_tenant_accounts AS mapping SET currency_code=account.currency_code FROM public.ledger_accounts AS account WHERE account.id=mapping.account_id AND mapping.currency_code IS NULL;
+    DO $validate$ BEGIN IF EXISTS (SELECT 1 FROM public.ledger_tenant_accounts WHERE currency_code IS NULL) THEN RAISE EXCEPTION 'Unable to backfill ledger tenant account currencies'; END IF; END $validate$;
+    ALTER TABLE public.ledger_tenant_accounts ALTER COLUMN currency_code SET NOT NULL;
+    ALTER TABLE public.ledger_tenant_accounts ADD CONSTRAINT ledger_tenant_accounts_currency_chk CHECK (currency_code ~ '^[A-Z]{3}$');
     ALTER TABLE public.ledger_tenant_accounts DROP CONSTRAINT uq_tenant_account_purpose;
     ALTER TABLE public.ledger_tenant_accounts ADD CONSTRAINT uq_tenant_account_purpose_currency UNIQUE (tenant_id,purpose,currency_code);
     CREATE TABLE public.ledger_command_idempotency (

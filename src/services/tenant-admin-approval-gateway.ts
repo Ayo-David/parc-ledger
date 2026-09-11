@@ -12,7 +12,7 @@ export class TenantAdminApprovalGateway implements ApprovalGateway {
     binding: Record<string, string>;
   }): Promise<void> {
     await this.call(
-      `/internal/v1/approvals/${input.approvalId}/consume`,
+      `/internal/v1/approvals/${encodeURIComponent(input.approvalId)}/consume`,
       input.tenantId,
       input.idempotencyKey,
       input.binding,
@@ -26,7 +26,7 @@ export class TenantAdminApprovalGateway implements ApprovalGateway {
     result?: Record<string, string>;
   }): Promise<void> {
     await this.call(
-      `/internal/v1/approvals/${input.approvalId}/execution`,
+      `/internal/v1/approvals/${encodeURIComponent(input.approvalId)}/execution`,
       input.tenantId,
       input.idempotencyKey,
       {
@@ -51,6 +51,7 @@ export class TenantAdminApprovalGateway implements ApprovalGateway {
         "idempotency-key": idempotencyKey,
       },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10_000),
     });
     if (!response.ok)
       throw new Error(

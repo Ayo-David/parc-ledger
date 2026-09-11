@@ -17,6 +17,9 @@ export class IntegrityWorker {
       check: "BALANCE_DRIFT",
     });
     return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await tx.raw("SELECT pg_advisory_xact_lock(hashtextextended(?,0))", [
+        `integrity:${tenantId}:${runReference}`,
+      ]);
       const existing = await tx("ledger_integrity_checks")
         .where({
           tenant_id: tenantId,

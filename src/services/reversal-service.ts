@@ -110,8 +110,13 @@ export class ReversalService {
           const journal = await tx("journals")
             .where({ transaction_id: input.transactionId, status: "POSTED" })
             .first<{ id: string }>();
+          if (!original || !journal)
+            throw new PostingError(
+              "TRANSACTION_NOT_REVERSIBLE",
+              "Completed transaction is unavailable for reversal",
+            );
           const entries = await tx("journal_entries")
-            .where({ journal_id: journal?.id })
+            .where({ journal_id: journal.id })
             .orderBy("entry_sequence")
             .select<
               {
@@ -120,7 +125,7 @@ export class ReversalService {
                 amount: string;
               }[]
             >("account_id", "entry_type", "amount");
-          if (!original || !journal || entries.length < 2)
+          if (entries.length < 2)
             throw new PostingError(
               "TRANSACTION_NOT_REVERSIBLE",
               "Completed transaction is unavailable for reversal",
@@ -196,12 +201,16 @@ export class ReversalService {
       );
     } catch (error) {
       if (input.approvalId && this.approvals)
-        await this.approvals.report({
-          tenantId: input.tenantId,
-          approvalId: input.approvalId,
-          idempotencyKey: input.idempotencyKey,
-          status: "FAILED",
-        });
+        try {
+          await this.approvals.report({
+            tenantId: input.tenantId,
+            approvalId: input.approvalId,
+            idempotencyKey: input.idempotencyKey,
+            status: "FAILED",
+          });
+        } catch {
+          console.error("Failed to report reversal failure", input.approvalId);
+        }
       throw error;
     }
     if (input.approvalId && this.approvals)

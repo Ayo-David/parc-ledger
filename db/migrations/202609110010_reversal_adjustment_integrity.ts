@@ -11,6 +11,7 @@ export async function up(knex: Knex): Promise<void> {
       ADD COLUMN request_hash char(64),
       ADD COLUMN source_service varchar(100),
       ADD COLUMN completed_at timestamptz;
+    UPDATE public.transaction_reversals SET approval_id=COALESCE(approval_id,gen_random_uuid()), idempotency_key=COALESCE(idempotency_key,id::text), request_hash=COALESCE(request_hash,encode(digest(id::text,'sha256'),'hex')), source_service=COALESCE(source_service,'legacy') WHERE approval_id IS NULL OR idempotency_key IS NULL OR request_hash IS NULL OR source_service IS NULL;
     ALTER TABLE public.transaction_reversals
       ALTER COLUMN idempotency_key SET NOT NULL,
       ALTER COLUMN request_hash SET NOT NULL,
@@ -24,6 +25,7 @@ export async function up(knex: Knex): Promise<void> {
       ADD COLUMN idempotency_key varchar(255),
       ADD COLUMN request_hash char(64),
       ADD COLUMN posted_transaction_id uuid;
+    UPDATE public.transaction_adjustments SET approval_id=COALESCE(approval_id,gen_random_uuid()), idempotency_key=COALESCE(idempotency_key,id::text), request_hash=COALESCE(request_hash,encode(digest(id::text,'sha256'),'hex')) WHERE approval_id IS NULL OR idempotency_key IS NULL OR request_hash IS NULL;
     ALTER TABLE public.transaction_adjustments
       ALTER COLUMN approval_id SET NOT NULL,
       ALTER COLUMN idempotency_key SET NOT NULL,
@@ -42,8 +44,10 @@ export async function up(knex: Knex): Promise<void> {
     DECLARE original_tenant uuid; reversal_tenant uuid; original_currency char(3); reversal_currency char(3); original_amount bigint; reversal_amount bigint;
     BEGIN
       SELECT tenant_id,currency_code,amount INTO original_tenant,original_currency,original_amount FROM public.ledger_transactions WHERE id=NEW.original_transaction_id AND status='COMPLETED';
+      IF NOT FOUND THEN RAISE EXCEPTION 'Reversal must be a full same-tenant same-currency compensating posting'; END IF;
       SELECT tenant_id,currency_code,amount INTO reversal_tenant,reversal_currency,reversal_amount FROM public.ledger_transactions WHERE id=NEW.reversal_transaction_id AND status='COMPLETED';
-      IF NOT FOUND OR original_tenant<>NEW.tenant_id OR reversal_tenant<>NEW.tenant_id OR original_currency<>reversal_currency OR original_amount<>reversal_amount THEN RAISE EXCEPTION 'Reversal must be a full same-tenant same-currency compensating posting'; END IF;
+      IF NOT FOUND THEN RAISE EXCEPTION 'Reversal must be a full same-tenant same-currency compensating posting'; END IF;
+      IF original_tenant<>NEW.tenant_id OR reversal_tenant<>NEW.tenant_id OR original_currency<>reversal_currency OR original_amount<>reversal_amount THEN RAISE EXCEPTION 'Reversal must be a full same-tenant same-currency compensating posting'; END IF;
       RETURN NEW;
     END $$;
     CREATE OR REPLACE FUNCTION public.prevent_financial_link_change() RETURNS trigger LANGUAGE plpgsql AS $$

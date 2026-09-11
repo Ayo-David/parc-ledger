@@ -15,6 +15,7 @@ export async function up(knex: Knex): Promise<void> {
       END LOOP;
     END $money$;
     ALTER TABLE public.ledger_transactions ADD COLUMN IF NOT EXISTS request_hash char(64);
+    UPDATE public.ledger_transactions SET idempotency_key=COALESCE(idempotency_key,id::text), request_hash=COALESCE(request_hash,encode(digest(id::text,'sha256'),'hex')) WHERE idempotency_key IS NULL OR request_hash IS NULL;
     ALTER TABLE public.ledger_transactions ALTER COLUMN idempotency_key SET NOT NULL;
     ALTER TABLE public.ledger_transactions ALTER COLUMN request_hash SET NOT NULL;
     ALTER TABLE public.journals ADD CONSTRAINT uq_journal_transaction UNIQUE (transaction_id);

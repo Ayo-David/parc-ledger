@@ -61,6 +61,9 @@ export async function up(knex: Knex): Promise<void> {
     END $$;
     CREATE OR REPLACE FUNCTION public.prevent_account_hold_lifecycle_change() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
+      IF TG_OP='DELETE' THEN
+        RAISE EXCEPTION 'Account holds cannot be deleted';
+      END IF;
       IF OLD.status<>'ACTIVE' AND NEW IS DISTINCT FROM OLD THEN
         RAISE EXCEPTION 'Terminal account holds are immutable';
       END IF;

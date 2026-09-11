@@ -31,22 +31,14 @@ export function createApp(input: {
   );
   app.post("/internal/v1/postings", async (req, res, next) => {
     try {
-      const token = req.header("x-internal-service-token") ?? "";
-      if (
-        token.length !== input.config.INTERNAL_SERVICE_TOKEN.length ||
-        !timingSafeEqual(
-          Buffer.from(token),
-          Buffer.from(input.config.INTERNAL_SERVICE_TOKEN),
-        )
-      )
-        throw new PostingError(
-          "UNAUTHORIZED",
-          "Internal service authentication required",
-        );
+      authenticate(
+        req.header("x-internal-service-token") ?? "",
+        input.config.INTERNAL_SERVICE_TOKEN,
+      );
       const tenantId = req.header("x-tenant-id");
       const idempotencyKey = req.header("idempotency-key");
-      const sourceService = req.header("x-calling-service");
-      if (!tenantId || !idempotencyKey || !sourceService)
+      const sourceService = input.config.SERVICE_NAME;
+      if (!tenantId || !idempotencyKey)
         throw new PostingError(
           "REQUEST_INVALID",
           "Tenant, idempotency key, and calling service are required",
@@ -70,11 +62,7 @@ export function createApp(input: {
         tenantId,
         reference: body.reference,
         currency: body.currency,
-        entries: body.entries.map((e) => ({
-          accountId: String(e.account_id),
-          direction: e.direction as "DEBIT" | "CREDIT",
-          amountMinor: String(e.amount_minor),
-        })),
+        entries: mapEntries(body.entries),
         idempotencyKey,
         sourceService,
         correlationId: req.header("x-correlation-id") ?? crypto.randomUUID(),
@@ -95,8 +83,8 @@ export function createApp(input: {
       );
       const tenantId = req.header("x-tenant-id"),
         idempotencyKey = req.header("idempotency-key"),
-        sourceService = req.header("x-calling-service");
-      if (!tenantId || !idempotencyKey || !sourceService)
+        sourceService = input.config.SERVICE_NAME;
+      if (!tenantId || !idempotencyKey)
         throw new PostingError(
           "REQUEST_INVALID",
           "Tenant, idempotency key, and calling service are required",
@@ -141,7 +129,11 @@ export function createApp(input: {
   });
   app.post("/internal/v1/holds", async (req, res, next) => {
     try {
-      const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
+      const context = internalContext(
+        req,
+        input.config.INTERNAL_SERVICE_TOKEN,
+        input.config.SERVICE_NAME,
+      );
       const body = req.body as Record<string, unknown>;
       if (
         ![
@@ -161,7 +153,7 @@ export function createApp(input: {
         purpose: String(body.purpose),
         expiresAt: String(body.expires_at),
         idempotencyKey: context.idempotencyKey,
-        sourceService: context.sourceService,
+        sourceService: input.config.SERVICE_NAME,
         correlationId: context.correlationId,
       });
       res
@@ -174,7 +166,11 @@ export function createApp(input: {
   });
   app.post("/internal/v1/holds/:id/release", async (req, res, next) => {
     try {
-      const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
+      const context = internalContext(
+        req,
+        input.config.INTERNAL_SERVICE_TOKEN,
+        input.config.SERVICE_NAME,
+      );
       const body = req.body as { reason?: unknown };
       if (body.reason !== undefined && typeof body.reason !== "string")
         throw new PostingError("REQUEST_INVALID", "Release reason is invalid");
@@ -194,7 +190,11 @@ export function createApp(input: {
   });
   app.post("/internal/v1/holds/:id/capture", async (req, res, next) => {
     try {
-      const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
+      const context = internalContext(
+        req,
+        input.config.INTERNAL_SERVICE_TOKEN,
+        input.config.SERVICE_NAME,
+      );
       const body = req.body as {
         reference?: unknown;
         entries?: Array<{
@@ -215,11 +215,7 @@ export function createApp(input: {
         sourceService: context.sourceService,
         correlationId: context.correlationId,
         reference: body.reference,
-        entries: body.entries.map((entry) => ({
-          accountId: String(entry.account_id),
-          direction: entry.direction as "DEBIT" | "CREDIT",
-          amountMinor: String(entry.amount_minor),
-        })),
+        entries: mapEntries(body.entries),
       });
       res
         .status(result.replayed ? 200 : 201)
@@ -236,6 +232,7 @@ export function createApp(input: {
         const context = internalContext(
           req,
           input.config.INTERNAL_SERVICE_TOKEN,
+          input.config.SERVICE_NAME,
         );
         const body = req.body as {
           reason?: unknown;
@@ -260,9 +257,6 @@ export function createApp(input: {
           ...(body.approval_id === undefined
             ? {}
             : { approvalId: body.approval_id }),
-          ...(body.automated_rule_id === undefined
-            ? {}
-            : { automatedRuleId: body.automated_rule_id }),
         });
         res
           .status(result.replayed ? 200 : 201)
@@ -275,7 +269,11 @@ export function createApp(input: {
   );
   app.post("/internal/v1/manual-adjustments", async (req, res, next) => {
     try {
-      const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
+      const context = internalContext(
+        req,
+        input.config.INTERNAL_SERVICE_TOKEN,
+        input.config.SERVICE_NAME,
+      );
       const body = req.body as {
         approval_id?: unknown;
         reference?: unknown;
@@ -304,13 +302,9 @@ export function createApp(input: {
         reference: body.reference,
         currency: body.currency,
         reason: body.reason,
-        entries: body.entries.map((entry) => ({
-          accountId: String(entry.account_id),
-          direction: entry.direction as "DEBIT" | "CREDIT",
-          amountMinor: String(entry.amount_minor),
-        })),
+        entries: mapEntries(body.entries),
         idempotencyKey: context.idempotencyKey,
-        sourceService: context.sourceService,
+        sourceService: input.config.SERVICE_NAME,
         correlationId: context.correlationId,
       });
       res
@@ -350,7 +344,7 @@ export function createApp(input: {
 }
 function authenticate(token: string, expected: string): void {
   if (
-    token.length !== expected.length ||
+    Buffer.byteLength(token) !== Buffer.byteLength(expected) ||
     !timingSafeEqual(Buffer.from(token), Buffer.from(expected))
   )
     throw new PostingError(
@@ -361,6 +355,7 @@ function authenticate(token: string, expected: string): void {
 function internalContext(
   req: express.Request,
   expectedToken: string,
+  sourceService: string,
 ): {
   tenantId: string;
   idempotencyKey: string;
@@ -369,9 +364,8 @@ function internalContext(
 } {
   authenticate(req.header("x-internal-service-token") ?? "", expectedToken);
   const tenantId = req.header("x-tenant-id"),
-    idempotencyKey = req.header("idempotency-key"),
-    sourceService = req.header("x-calling-service");
-  if (!tenantId || !idempotencyKey || !sourceService)
+    idempotencyKey = req.header("idempotency-key");
+  if (!tenantId || !idempotencyKey)
     throw new PostingError(
       "REQUEST_INVALID",
       "Tenant, idempotency key, and calling service are required",
@@ -382,4 +376,35 @@ function internalContext(
     sourceService,
     correlationId: req.header("x-correlation-id") ?? crypto.randomUUID(),
   };
+}
+
+function mapEntries(entries: unknown): Array<{
+  accountId: string;
+  direction: "DEBIT" | "CREDIT";
+  amountMinor: string;
+}> {
+  if (!Array.isArray(entries))
+    throw new PostingError("REQUEST_INVALID", "Entries must be an array");
+  return entries.map((entry) => {
+    if (
+      entry === null ||
+      typeof entry !== "object" ||
+      typeof (entry as Record<string, unknown>).account_id !== "string" ||
+      !["DEBIT", "CREDIT"].includes(
+        (entry as Record<string, unknown>).direction as string,
+      ) ||
+      typeof (entry as Record<string, unknown>).amount_minor !== "string"
+    )
+      throw new PostingError("REQUEST_INVALID", "Invalid posting entry");
+    const value = entry as {
+      account_id: string;
+      direction: "DEBIT" | "CREDIT";
+      amount_minor: string;
+    };
+    return {
+      accountId: value.account_id,
+      direction: value.direction,
+      amountMinor: value.amount_minor,
+    };
+  });
 }

@@ -7,7 +7,7 @@ const snapshotUrl = new URL("../schema/current.sql", import.meta.url);
 const approvedExistingBaselineHash =
   "527bb8922a09f2cbc5bc340ef743ba24c781e4412c651d1732d4181826f48d41";
 const canonicalSnapshotHash =
-  "3c662204cf5fcd529e79f7b8fece31c9b776267cd582d863fc6e1c4e2ee3b806";
+  "8e8ee8b7a12dadaf98d960de83ce8cd26740949dbc0115010485d9fb474aa359";
 export const config = { transaction: false };
 
 export async function up(knex: Knex): Promise<void> {

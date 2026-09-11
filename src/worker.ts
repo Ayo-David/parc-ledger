@@ -11,8 +11,30 @@ const worker = new EventWorker(
   database,
   `${config.SERVICE_NAME}-${process.pid}`,
 );
+let publishing = false;
+async function shutdown(exitCode = 0): Promise<void> {
+  clearInterval(timer);
+  await channel.close().catch(() => undefined);
+  await connection.close().catch(() => undefined);
+  await database.destroy();
+  process.exitCode = exitCode;
+}
 const connection = await amqp.connect(config.AMQP_URL);
 const channel = await connection.createConfirmChannel();
+connection.on("error", (error) => {
+  console.error("AMQP connection failed", error);
+  void shutdown(1);
+});
+connection.on("close", () => {
+  void shutdown(1);
+});
+channel.on("error", (error) => {
+  console.error("AMQP channel failed", error);
+  void shutdown(1);
+});
+channel.on("close", () => {
+  void shutdown(1);
+});
 await channel.assertExchange("parc.events", "topic", { durable: true });
 await channel.assertExchange("parc.events.dlx", "topic", { durable: true });
 const queue = "parc.ledger.inbox.v1";
@@ -68,11 +90,15 @@ async function handle(message: amqp.ConsumeMessage | null): Promise<void> {
   }
 }
 const timer = setInterval(() => {
-  void worker.publishOne(channel);
+  if (publishing) return;
+  publishing = true;
+  void worker
+    .publishOne(channel)
+    .catch((error) => console.error("Outbox publish cycle failed", error))
+    .finally(() => {
+      publishing = false;
+    });
 }, 250);
 process.on("SIGTERM", () => {
-  clearInterval(timer);
-  void channel.close();
-  void connection.close();
-  void database.destroy();
+  void shutdown();
 });

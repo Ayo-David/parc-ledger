@@ -43,6 +43,7 @@ export class AdjustmentService {
     transaction_id: string;
     replayed: boolean;
   }> {
+    validateAdjustment(input);
     const amount = input.entries
       .filter((e) => e.direction === "DEBIT")
       .reduce((sum, e) => sum + BigInt(e.amountMinor), 0n)
@@ -143,12 +144,16 @@ export class AdjustmentService {
         },
       );
     } catch (error) {
-      await this.approvals.report({
-        tenantId: input.tenantId,
-        approvalId: input.approvalId,
-        idempotencyKey: input.idempotencyKey,
-        status: "FAILED",
-      });
+      try {
+        await this.approvals.report({
+          tenantId: input.tenantId,
+          approvalId: input.approvalId,
+          idempotencyKey: input.idempotencyKey,
+          status: "FAILED",
+        });
+      } catch {
+        console.error("Failed to report adjustment failure", input.approvalId);
+      }
       throw error;
     }
     await this.approvals.report({
@@ -163,6 +168,25 @@ export class AdjustmentService {
     });
     return result;
   }
+}
+function validateAdjustment(input: {
+  currency: string;
+  entries: Array<{ direction: string; amountMinor: string }>;
+}): void {
+  if (!/^[A-Z]{3}$/.test(input.currency) || input.entries.length < 2)
+    throw new PostingError(
+      "AMOUNT_INVALID",
+      "Adjustment currency and entries are invalid",
+    );
+  for (const entry of input.entries)
+    if (
+      !["DEBIT", "CREDIT"].includes(entry.direction) ||
+      !/^[1-9][0-9]*$/.test(entry.amountMinor)
+    )
+      throw new PostingError(
+        "AMOUNT_INVALID",
+        "Amounts must be positive integer minor-unit strings",
+      );
 }
 function hash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");

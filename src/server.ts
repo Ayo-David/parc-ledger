@@ -34,6 +34,7 @@ const server = createServer(
 );
 server.listen(config.PORT, config.HOST);
 process.on("SIGTERM", () => {
-  server.close();
-  void database.destroy();
+  server.close(() => {
+    void database.destroy();
+  });
 });

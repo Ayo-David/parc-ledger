@@ -47,6 +47,9 @@ export class PostingService {
     replayed: boolean;
   }> {
     validate(input);
+    await tx.raw("SELECT pg_advisory_xact_lock(hashtextextended(?,0))", [
+      `posting:${input.tenantId}:${input.idempotencyKey}`,
+    ]);
     const hash = commandHash(input);
     const existing = await tx("ledger_transactions")
       .where({
@@ -155,7 +158,7 @@ export class PostingService {
     const postedJournal = await tx("journals")
       .where({ id: journalId })
       .first<{ posted_at: Date }>("posted_at");
-    if (postedJournal?.posted_at === undefined)
+    if (postedJournal?.posted_at == null)
       throw new PostingError(
         "POSTING_INCOMPLETE",
         "Posted journal timestamp was not persisted",

@@ -234,10 +234,22 @@ export class HoldService {
         .forUpdate()
         .skipLocked()
         .select<{ id: string }[]>("id");
-      for (const hold of holds)
+      for (const hold of holds) {
         await tx("account_holds")
           .where({ id: hold.id, status: "ACTIVE" })
           .update({ status: "EXPIRED", released_at: tx.fn.now() });
+        await auditAndEvent(
+          tx,
+          tenantId,
+          hold.id,
+          "EXPIRE",
+          "parc-ledger",
+          { hold_id: hold.id, status: "EXPIRED" },
+          `hold-expire:${hold.id}`,
+          hold.id,
+          "ledger.hold-expired.v1",
+        );
+      }
       return holds.length;
     });
   }
@@ -339,13 +351,18 @@ export class HoldService {
           response_body: result,
           updated_at: tx.fn.now(),
         });
-      await audit(
+      await auditAndEvent(
         tx,
         input.tenantId,
         hold.id,
         action,
         input.sourceService,
         result,
+        input.idempotencyKey,
+        input.correlationId,
+        action === "RELEASE"
+          ? "ledger.hold-released.v1"
+          : "ledger.hold-captured.v1",
       );
       return { ...result, replayed: false };
     });
@@ -437,22 +454,5 @@ async function auditAndEvent(
     payload,
     idempotency_key: idempotencyKey,
     correlation_id: correlationId,
-  });
-}
-async function audit(
-  tx: Knex.Transaction,
-  tenantId: string,
-  holdId: string,
-  action: string,
-  service: string,
-  payload: object,
-): Promise<void> {
-  await tx("ledger_audit_logs").insert({
-    tenant_id: tenantId,
-    entity_type: "account_hold",
-    entity_id: holdId,
-    action,
-    service_name: service,
-    after_data: payload,
   });
 }
