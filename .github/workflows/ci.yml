@@ -1,0 +1,36 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: { POSTGRES_PASSWORD: postgres, POSTGRES_DB: parc_ledger_test }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with: { node-version: 22.21.1, cache: yarn }
+      - run: yarn install --frozen-lockfile
+      - run: yarn migrate:latest
+        env:
+          {
+            DATABASE_URL: postgresql://postgres:postgres@localhost:5432/parc_ledger_test,
+          }
+      - run: yarn validate
+        env:
+          {
+            TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/parc_ledger_test,
+          }
+      - run: yarn audit

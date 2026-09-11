@@ -71,7 +71,8 @@ CREATE TYPE public.hold_status AS ENUM (
     'ACTIVE',
     'RELEASED',
     'EXPIRED',
-    'CANCELLED'
+    'CANCELLED',
+    'CAPTURED'
 );
 
 
@@ -157,7 +158,8 @@ CREATE TYPE public.ledger_event_status AS ENUM (
 CREATE TYPE public.ledger_outbox_status AS ENUM (
     'PENDING',
     'PUBLISHED',
-    'FAILED'
+    'FAILED',
+    'DEAD_LETTERED'
 );
 
 
@@ -259,6 +261,91 @@ CREATE TYPE public.transaction_type AS ENUM (
 );
 
 
+SET default_tablespace = '';
+
+SET default_table_access_method = heap;
+
+--
+-- Name: ledger_outbox_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ledger_outbox_events (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    aggregate_type character varying(100) NOT NULL,
+    aggregate_id uuid NOT NULL,
+    event_type character varying(150) NOT NULL,
+    event_version integer DEFAULT 1 NOT NULL,
+    payload jsonb NOT NULL,
+    idempotency_key character varying(255),
+    correlation_id uuid,
+    causation_id uuid,
+    status public.ledger_outbox_status DEFAULT 'PENDING'::public.ledger_outbox_status NOT NULL,
+    retry_count integer DEFAULT 0 NOT NULL,
+    available_at timestamp with time zone DEFAULT now() NOT NULL,
+    published_at timestamp with time zone,
+    last_error text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    processing_started_at timestamp with time zone,
+    lease_expires_at timestamp with time zone,
+    published_exchange character varying(150),
+    published_routing_key character varying(255),
+    last_attempt_at timestamp with time zone,
+    claimed_by character varying(100),
+    CONSTRAINT ledger_outbox_retry_chk CHECK ((retry_count >= 0)),
+    CONSTRAINT ledger_outbox_version_chk CHECK ((event_version > 0))
+);
+
+ALTER TABLE ONLY public.ledger_outbox_events FORCE ROW LEVEL SECURITY;
+
+
+--
+-- Name: TABLE ledger_outbox_events; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON TABLE public.ledger_outbox_events IS 'Transactional outbox used to publish ledger posting/reversal/completion events after accounting changes commit.';
+
+
+--
+-- Name: claim_next_ledger_outbox(text, integer); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.claim_next_ledger_outbox(p_worker_id text, p_lease_seconds integer DEFAULT 30) RETURNS SETOF public.ledger_outbox_events
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'public', 'pg_temp'
+    AS $$
+    BEGIN
+      IF nullif(btrim(p_worker_id), '') IS NULL THEN
+        RAISE EXCEPTION 'Worker id is required';
+      END IF;
+      RETURN QUERY
+        UPDATE public.ledger_outbox_events o
+        SET processing_started_at=now(),
+            lease_expires_at=now()+make_interval(secs=>greatest(5, least(p_lease_seconds, 300))),
+            last_attempt_at=now(),
+            claimed_by=p_worker_id
+        WHERE o.id=(
+          SELECT id FROM public.ledger_outbox_events
+          WHERE status='PENDING' AND available_at<=now()
+            AND (lease_expires_at IS NULL OR lease_expires_at<now())
+          ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
+        )
+        RETURNING o.*;
+    END
+    $$;
+
+
+--
+-- Name: complete_ledger_outbox(uuid, text, text, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.complete_ledger_outbox(p_id uuid, p_worker_id text, p_exchange text, p_routing_key text) RETURNS boolean
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'public', 'pg_temp'
+    AS $$
+    BEGIN UPDATE public.ledger_outbox_events SET status='PUBLISHED',published_at=now(),published_exchange=p_exchange,published_routing_key=p_routing_key,lease_expires_at=NULL WHERE id=p_id AND status='PENDING' AND claimed_by=p_worker_id; RETURN FOUND; END $$;
+
+
 --
 -- Name: current_tenant_id(); Type: FUNCTION; Schema: public; Owner: -
 --
@@ -277,38 +364,37 @@ $$;
 
 
 --
+-- Name: fail_ledger_outbox(uuid, text, text, integer); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.fail_ledger_outbox(p_id uuid, p_worker_id text, p_error text, p_max_retries integer DEFAULT 8) RETURNS text
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO 'public', 'pg_temp'
+    AS $$
+    DECLARE next_retry integer; next_status public.ledger_outbox_status;
+    BEGIN SELECT retry_count+1 INTO next_retry FROM public.ledger_outbox_events WHERE id=p_id AND status='PENDING' AND claimed_by=p_worker_id FOR UPDATE; IF NOT FOUND THEN RETURN 'NOT_CLAIMED'; END IF;
+      next_status:=CASE WHEN next_retry>=p_max_retries THEN 'DEAD_LETTERED'::public.ledger_outbox_status ELSE 'PENDING'::public.ledger_outbox_status END;
+      UPDATE public.ledger_outbox_events SET retry_count=next_retry,status=next_status,available_at=now()+(LEAST(300000,1000*power(2,next_retry))*(0.75+random()*0.5))*interval '1 millisecond',lease_expires_at=NULL,claimed_by=NULL,last_error=left(p_error,1000) WHERE id=p_id;
+      RETURN next_status::text;
+    END $$;
+
+
+--
 -- Name: journal_posting_guard(); Type: FUNCTION; Schema: public; Owner: -
 --
 
 CREATE FUNCTION public.journal_posting_guard() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-DECLARE
-    v_total_debits NUMERIC(20,2);
-    v_total_credits NUMERIC(20,2);
+DECLARE debits bigint; credits bigint;
 BEGIN
-    IF NEW.status = 'POSTED'
-       AND OLD.status <> 'POSTED' THEN
-
-        PERFORM validate_journal_balance(NEW.id);
-
-        SELECT total_debits, total_credits
-        INTO v_total_debits, v_total_credits
-        FROM journals
-        WHERE id = NEW.id;
-
-        NEW.total_debits = v_total_debits;
-        NEW.total_credits = v_total_credits;
-
-        NEW.posted_at = COALESCE(
-            NEW.posted_at,
-            NOW()
-        );
-    END IF;
-
-    RETURN NEW;
-END;
-$$;
+  IF NEW.status='POSTED' AND OLD.status<>'POSTED' THEN
+    PERFORM validate_journal_balance(NEW.id);
+    SELECT COALESCE(SUM(CASE WHEN entry_type='DEBIT' THEN amount ELSE 0 END),0)::bigint,COALESCE(SUM(CASE WHEN entry_type='CREDIT' THEN amount ELSE 0 END),0)::bigint INTO debits,credits FROM journal_entries WHERE journal_id=NEW.id;
+    NEW.total_debits=debits; NEW.total_credits=credits; NEW.posted_at=COALESCE(NEW.posted_at,now());
+  END IF;
+  RETURN NEW;
+END $$;
 
 
 --
@@ -318,90 +404,77 @@ $$;
 CREATE FUNCTION public.post_journal(p_journal_id uuid, p_actor_id uuid DEFAULT NULL::uuid) RETURNS void
     LANGUAGE plpgsql
     AS $$
-DECLARE
-    v_status journal_status;
-    v_period_status period_status;
-    v_period_id UUID;
-    v_journal_book UUID;
-    v_period_book UUID;
-    v_transaction_book UUID;
-    v_transaction_id UUID;
+DECLARE entry record; debits bigint; credits bigint;
 BEGIN
-    SELECT
-        status,
-        accounting_period_id,
-        book_id,
-        transaction_id
-    INTO
-        v_status,
-        v_period_id,
-        v_journal_book,
-        v_transaction_id
-    FROM journals
-    WHERE id = p_journal_id
-    FOR UPDATE;
+  PERFORM validate_journal_balance(p_journal_id);
+  SELECT COALESCE(SUM(CASE WHEN entry_type='DEBIT' THEN amount ELSE 0 END),0)::bigint,COALESCE(SUM(CASE WHEN entry_type='CREDIT' THEN amount ELSE 0 END),0)::bigint INTO debits,credits FROM journal_entries WHERE journal_id=p_journal_id;
+  UPDATE journals SET status='POSTED',posted_at=now(),posted_by=p_actor_id,total_debits=debits,total_credits=credits WHERE id=p_journal_id AND status IN ('DRAFT','PENDING');
+  IF NOT FOUND THEN RAISE EXCEPTION 'Journal % cannot be posted',p_journal_id; END IF;
+  FOR entry IN SELECT account_id,currency_code FROM journal_entries WHERE journal_id=p_journal_id GROUP BY account_id,currency_code ORDER BY account_id LOOP PERFORM refresh_ledger_account_balance(entry.account_id,entry.currency_code); END LOOP;
+  UPDATE ledger_transactions SET status='COMPLETED',completed_at=COALESCE(completed_at,now()) WHERE id=(SELECT transaction_id FROM journals WHERE id=p_journal_id) AND status IN ('PENDING','PROCESSING');
+END $$;
 
-    IF NOT FOUND THEN
-        RAISE EXCEPTION
-            'Journal % does not exist.',
-            p_journal_id;
-    END IF;
 
-    IF v_status NOT IN ('DRAFT', 'PENDING') THEN
-        RAISE EXCEPTION
-            'Journal % cannot be posted from status %.',
-            p_journal_id,
-            v_status;
-    END IF;
+--
+-- Name: prevent_account_hold_lifecycle_change(); Type: FUNCTION; Schema: public; Owner: -
+--
 
-    IF v_period_id IS NOT NULL THEN
-        SELECT status, book_id
-        INTO v_period_status, v_period_book
-        FROM accounting_periods
-        WHERE id = v_period_id;
+CREATE FUNCTION public.prevent_account_hold_lifecycle_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+            IF TG_OP='DELETE' THEN
+                RAISE EXCEPTION 'Account holds cannot be deleted';
+            END IF;
+            IF OLD.status<>'ACTIVE' AND NEW IS DISTINCT FROM OLD THEN
+        RAISE EXCEPTION 'Terminal account holds are immutable';
+      END IF;
+      IF OLD.status='ACTIVE' AND NEW.status NOT IN ('ACTIVE','RELEASED','EXPIRED','CANCELLED','CAPTURED') THEN
+        RAISE EXCEPTION 'Invalid account hold state transition';
+      END IF;
+      IF NEW.status='CAPTURED' AND NEW.capture_transaction_id IS NULL THEN
+        RAISE EXCEPTION 'Captured hold requires a posted transaction';
+      END IF;
+      RETURN NEW;
+    END $$;
 
-        IF v_period_status <> 'OPEN' THEN
-            RAISE EXCEPTION
-                'Accounting period is not open.';
-        END IF;
 
-        IF v_period_book <> v_journal_book THEN
-            RAISE EXCEPTION
-                'Journal and accounting period belong to different books.';
-        END IF;
-    END IF;
+--
+-- Name: prevent_completed_integrity_evidence_change(); Type: FUNCTION; Schema: public; Owner: -
+--
 
-    IF v_transaction_id IS NOT NULL THEN
-        SELECT book_id
-        INTO v_transaction_book
-        FROM ledger_transactions
-        WHERE id = v_transaction_id;
+CREATE FUNCTION public.prevent_completed_integrity_evidence_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF OLD.status IN ('PASSED','FAILED') AND (TG_OP='DELETE' OR NEW IS DISTINCT FROM OLD) THEN
+        RAISE EXCEPTION 'Completed integrity evidence is immutable';
+      END IF;
+      RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
+    END $$;
 
-        IF v_transaction_book <> v_journal_book THEN
-            RAISE EXCEPTION
-                'Journal and ledger transaction belong to different books.';
-        END IF;
-    END IF;
 
-    PERFORM validate_journal_balance(p_journal_id);
+--
+-- Name: prevent_completed_ledger_transaction_change(); Type: FUNCTION; Schema: public; Owner: -
+--
 
-    UPDATE journals
-    SET
-        status = 'POSTED',
-        posted_at = NOW(),
-        posted_by = p_actor_id
-    WHERE id = p_journal_id;
+CREATE FUNCTION public.prevent_completed_ledger_transaction_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF OLD.status IN ('COMPLETED','REVERSED') AND (TG_OP='DELETE' OR NEW.book_id IS DISTINCT FROM OLD.book_id OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id OR NEW.amount IS DISTINCT FROM OLD.amount OR NEW.currency_code IS DISTINCT FROM OLD.currency_code OR NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key OR NEW.request_hash IS DISTINCT FROM OLD.request_hash OR NEW.transaction_type IS DISTINCT FROM OLD.transaction_type) THEN RAISE EXCEPTION 'Completed/reversed ledger transactions are immutable'; END IF;
+      RETURN COALESCE(NEW, OLD);
+    END $$;
 
-    IF v_transaction_id IS NOT NULL THEN
-        UPDATE ledger_transactions
-        SET
-            status = 'COMPLETED',
-            completed_at = COALESCE(completed_at, NOW())
-        WHERE id = v_transaction_id
-          AND status IN ('PENDING', 'PROCESSING');
-    END IF;
-END;
-$$;
+
+--
+-- Name: prevent_financial_link_change(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.prevent_financial_link_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN IF TG_OP='DELETE' OR OLD IS DISTINCT FROM NEW THEN RAISE EXCEPTION 'Financial linkage is immutable'; END IF; RETURN NEW; END $$;
 
 
 --
@@ -429,25 +502,13 @@ $$;
 CREATE FUNCTION public.prevent_posted_journal_entry_change() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-DECLARE
-    current_status journal_status;
-BEGIN
-
-    SELECT status
-    INTO current_status
-    FROM journals
-    WHERE id = OLD.journal_id;
-
-    IF current_status IN ('POSTED', 'REVERSED') THEN
-
-        RAISE EXCEPTION
-            'Posted/reversed journal entries are immutable. Use a new reversal or adjustment instead.';
-
-    END IF;
-
-    RETURN COALESCE(NEW, OLD);
-END;
-$$;
+    DECLARE state journal_status; journal uuid;
+    BEGIN
+      journal := COALESCE(NEW.journal_id, OLD.journal_id);
+      SELECT status INTO state FROM journals WHERE id=journal;
+      IF state IN ('POSTED','REVERSED') THEN RAISE EXCEPTION 'Posted/reversed journal entries are immutable'; END IF;
+      RETURN COALESCE(NEW, OLD);
+    END $$;
 
 
 --
@@ -490,116 +551,34 @@ $$;
 
 
 --
+-- Name: refresh_balance_for_account_hold(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.refresh_balance_for_account_hold() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      PERFORM public.refresh_ledger_account_balance(COALESCE(NEW.account_id,OLD.account_id), COALESCE(NEW.currency_code,OLD.currency_code));
+      RETURN COALESCE(NEW,OLD);
+    END $$;
+
+
+--
 -- Name: refresh_ledger_account_balance(uuid, character); Type: FUNCTION; Schema: public; Owner: -
 --
 
 CREATE FUNCTION public.refresh_ledger_account_balance(p_account_id uuid, p_currency character) RETURNS void
     LANGUAGE plpgsql
     AS $$
-DECLARE
-    v_debit NUMERIC(20,2);
-    v_credit NUMERIC(20,2);
-    v_normal_balance account_nature;
-    v_balance NUMERIC(20,2);
-    v_held NUMERIC(20,2);
-    v_last_entry UUID;
+DECLARE debits bigint; credits bigint; normal account_nature; held bigint; last_entry uuid; computed bigint;
 BEGIN
-    SELECT normal_balance
-    INTO v_normal_balance
-    FROM ledger_accounts
-    WHERE id = p_account_id
-      AND status = 'ACTIVE'
-      AND deleted_at IS NULL;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION
-            'Active ledger account % does not exist.',
-            p_account_id;
-    END IF;
-
-    SELECT
-        COALESCE(SUM(CASE WHEN je.entry_type = 'DEBIT' THEN je.amount ELSE 0 END), 0),
-        COALESCE(SUM(CASE WHEN je.entry_type = 'CREDIT' THEN je.amount ELSE 0 END), 0)
-    INTO
-        v_debit,
-        v_credit
-    FROM journal_entries je
-    INNER JOIN journals j
-        ON j.id = je.journal_id
-    WHERE je.account_id = p_account_id
-      AND je.currency_code = p_currency
-      AND j.status = 'POSTED';
-
-    SELECT je.id
-    INTO v_last_entry
-    FROM journal_entries je
-    INNER JOIN journals j
-        ON j.id = je.journal_id
-    WHERE je.account_id = p_account_id
-      AND je.currency_code = p_currency
-      AND j.status = 'POSTED'
-    ORDER BY j.posted_at DESC NULLS LAST,
-             je.created_at DESC,
-             je.entry_sequence DESC
-    LIMIT 1;
-
-    SELECT COALESCE(SUM(amount), 0)
-    INTO v_held
-    FROM account_holds
-    WHERE account_id = p_account_id
-      AND currency_code = p_currency
-      AND status = 'ACTIVE'
-      AND (expires_at IS NULL OR expires_at > NOW());
-
-    v_balance :=
-        CASE
-            WHEN v_normal_balance = 'DEBIT'
-            THEN v_debit - v_credit
-            ELSE v_credit - v_debit
-        END;
-
-    INSERT INTO ledger_account_balances (
-        tenant_id,
-        account_id,
-        currency_code,
-        posted_debit,
-        posted_credit,
-        balance,
-        available_balance,
-        held_balance,
-        last_entry_id,
-        version,
-        calculated_at,
-        updated_at
-    )
-    SELECT
-        la.tenant_id,
-        p_account_id,
-        p_currency,
-        v_debit,
-        v_credit,
-        v_balance,
-        v_balance - v_held,
-        v_held,
-        v_last_entry,
-        1,
-        NOW(),
-        NOW()
-    FROM ledger_accounts la
-    WHERE la.id = p_account_id
-    ON CONFLICT (account_id, currency_code)
-    DO UPDATE SET
-        posted_debit = EXCLUDED.posted_debit,
-        posted_credit = EXCLUDED.posted_credit,
-        balance = EXCLUDED.balance,
-        available_balance = EXCLUDED.available_balance,
-        held_balance = EXCLUDED.held_balance,
-        last_entry_id = EXCLUDED.last_entry_id,
-        version = ledger_account_balances.version + 1,
-        calculated_at = NOW(),
-        updated_at = NOW();
-END;
-$$;
+ SELECT normal_balance INTO normal FROM ledger_accounts WHERE id=p_account_id AND status='ACTIVE' AND deleted_at IS NULL FOR UPDATE; IF NOT FOUND THEN RAISE EXCEPTION 'Active ledger account % does not exist',p_account_id; END IF;
+ SELECT COALESCE(SUM(CASE WHEN je.entry_type='DEBIT' THEN je.amount ELSE 0 END),0)::bigint,COALESCE(SUM(CASE WHEN je.entry_type='CREDIT' THEN je.amount ELSE 0 END),0)::bigint INTO debits,credits FROM journal_entries je JOIN journals j ON j.id=je.journal_id WHERE je.account_id=p_account_id AND je.currency_code=p_currency AND j.status='POSTED';
+ SELECT COALESCE(SUM(amount),0)::bigint INTO held FROM account_holds WHERE account_id=p_account_id AND currency_code=p_currency AND status='ACTIVE' AND (expires_at IS NULL OR expires_at>now());
+ SELECT je.id INTO last_entry FROM journal_entries je JOIN journals j ON j.id=je.journal_id WHERE je.account_id=p_account_id AND je.currency_code=p_currency AND j.status='POSTED' ORDER BY j.posted_at DESC,je.entry_sequence DESC LIMIT 1;
+ computed:=CASE WHEN normal='DEBIT' THEN debits-credits ELSE credits-debits END;
+ INSERT INTO ledger_account_balances (tenant_id,account_id,currency_code,posted_debit,posted_credit,balance,available_balance,held_balance,last_entry_id,version,calculated_at,updated_at) SELECT tenant_id,p_account_id,p_currency,debits,credits,computed,computed-held,held,last_entry,1,now(),now() FROM ledger_accounts WHERE id=p_account_id ON CONFLICT (account_id,currency_code) DO UPDATE SET posted_debit=EXCLUDED.posted_debit,posted_credit=EXCLUDED.posted_credit,balance=EXCLUDED.balance,available_balance=EXCLUDED.available_balance,held_balance=EXCLUDED.held_balance,last_entry_id=EXCLUDED.last_entry_id,version=ledger_account_balances.version+1,calculated_at=now(),updated_at=now();
+END $$;
 
 
 --
@@ -614,6 +593,37 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: validate_account_hold_scope(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_account_hold_scope() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE account_tenant uuid; account_currency char(3);
+    BEGIN
+      SELECT tenant_id,currency_code INTO account_tenant,account_currency FROM public.ledger_accounts WHERE id=NEW.account_id;
+      IF NOT FOUND OR account_tenant<>NEW.tenant_id OR account_currency<>NEW.currency_code THEN
+        RAISE EXCEPTION 'Account hold must match active account tenant and currency';
+      END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
+-- Name: validate_customer_ledger_account_scope(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_customer_ledger_account_scope() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE account_tenant uuid; account_currency char(3);
+    BEGIN SELECT tenant_id,currency_code INTO account_tenant,account_currency FROM ledger_accounts WHERE id=NEW.ledger_account_id;
+      IF NOT FOUND OR account_tenant<>NEW.tenant_id OR account_currency<>NEW.currency_code THEN RAISE EXCEPTION 'Customer ledger account must match tenant and currency'; END IF;
+      RETURN NEW;
+    END $$;
 
 
 --
@@ -813,6 +823,26 @@ $$;
 
 
 --
+-- Name: validate_ledger_inbox_transition(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_ledger_inbox_transition() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN IF OLD.status='PROCESSED' AND NEW IS DISTINCT FROM OLD THEN RAISE EXCEPTION 'Processed inbox events are immutable'; END IF; IF NEW.retry_count<OLD.retry_count THEN RAISE EXCEPTION 'Worker retry count cannot decrease'; END IF; RETURN NEW; END $$;
+
+
+--
+-- Name: validate_ledger_outbox_transition(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_ledger_outbox_transition() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN IF OLD.status='PUBLISHED' AND NEW IS DISTINCT FROM OLD THEN RAISE EXCEPTION 'Published outbox events are immutable'; END IF; IF NEW.retry_count<OLD.retry_count THEN RAISE EXCEPTION 'Worker retry count cannot decrease'; END IF; RETURN NEW; END $$;
+
+
+--
 -- Name: validate_ledger_transaction_book_scope(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -845,9 +875,54 @@ END;
 $$;
 
 
-SET default_tablespace = '';
+--
+-- Name: validate_ledger_worker_transition(); Type: FUNCTION; Schema: public; Owner: -
+--
 
-SET default_table_access_method = heap;
+CREATE FUNCTION public.validate_ledger_worker_transition() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF OLD.status='PROCESSED' AND NEW IS DISTINCT FROM OLD THEN RAISE EXCEPTION 'Processed inbox events are immutable'; END IF;
+      IF OLD.status='PUBLISHED' AND NEW IS DISTINCT FROM OLD THEN RAISE EXCEPTION 'Published outbox events are immutable'; END IF;
+      IF NEW.retry_count<OLD.retry_count THEN RAISE EXCEPTION 'Worker retry count cannot decrease'; END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
+-- Name: validate_tenant_ledger_account_scope(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_tenant_ledger_account_scope() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE account_tenant uuid; account_book uuid; account_currency char(3);
+    BEGIN SELECT tenant_id,book_id,currency_code INTO account_tenant,account_book,account_currency FROM ledger_accounts WHERE id=NEW.account_id;
+      IF NOT FOUND OR account_tenant<>NEW.tenant_id OR account_book<>NEW.book_id OR account_currency<>NEW.currency_code THEN RAISE EXCEPTION 'Tenant ledger account must match tenant, book and currency'; END IF;
+      RETURN NEW;
+    END $$;
+
+
+--
+-- Name: validate_transaction_reversal_scope(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.validate_transaction_reversal_scope() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE original_row public.ledger_transactions%ROWTYPE; reversal_row public.ledger_transactions%ROWTYPE;
+    BEGIN
+      SELECT * INTO original_row FROM public.ledger_transactions WHERE id=NEW.original_transaction_id AND status='COMPLETED';
+      IF NOT FOUND THEN RAISE EXCEPTION 'Original transaction must exist and be completed'; END IF;
+      SELECT * INTO reversal_row FROM public.ledger_transactions WHERE id=NEW.reversal_transaction_id AND status='COMPLETED';
+      IF NOT FOUND THEN RAISE EXCEPTION 'Reversal transaction must exist and be completed'; END IF;
+      IF original_row.tenant_id<>NEW.tenant_id OR reversal_row.tenant_id<>NEW.tenant_id OR original_row.book_id<>reversal_row.book_id OR original_row.currency_code<>reversal_row.currency_code OR original_row.amount<>reversal_row.amount THEN
+        RAISE EXCEPTION 'Reversal must be a full same-tenant same-book same-currency compensating posting';
+      END IF;
+      RETURN NEW;
+    END $$;
+
 
 --
 -- Name: account_hold_releases; Type: TABLE; Schema: public; Owner: -
@@ -857,13 +932,15 @@ CREATE TABLE public.account_hold_releases (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     tenant_id uuid NOT NULL,
     hold_id uuid NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     reason text,
     released_by uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT hold_release_amount_chk CHECK ((amount > (0)::numeric))
+    CONSTRAINT hold_release_amount_chk CHECK (((amount)::numeric > (0)::numeric))
 );
+
+ALTER TABLE ONLY public.account_hold_releases FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -875,7 +952,7 @@ CREATE TABLE public.account_holds (
     tenant_id uuid NOT NULL,
     account_id uuid NOT NULL,
     hold_reference character varying(100) NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     status public.hold_status DEFAULT 'ACTIVE'::public.hold_status NOT NULL,
     reason character varying(255) NOT NULL,
@@ -887,8 +964,14 @@ CREATE TABLE public.account_holds (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     created_by uuid,
     released_by uuid,
-    CONSTRAINT account_hold_amount_chk CHECK ((amount > (0)::numeric))
+    captured_at timestamp with time zone,
+    captured_by uuid,
+    capture_transaction_id uuid,
+    CONSTRAINT account_hold_amount_chk CHECK (((amount)::numeric > (0)::numeric)),
+    CONSTRAINT account_hold_capture_state_chk CHECK ((((status = 'CAPTURED'::public.hold_status) AND (captured_at IS NOT NULL) AND (capture_transaction_id IS NOT NULL)) OR ((status <> 'CAPTURED'::public.hold_status) AND (captured_at IS NULL) AND (capture_transaction_id IS NULL))))
 );
+
+ALTER TABLE ONLY public.account_holds FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -910,6 +993,8 @@ CREATE TABLE public.accounting_periods (
     CONSTRAINT accounting_period_dates_chk CHECK ((end_date >= start_date))
 );
 
+ALTER TABLE ONLY public.accounting_periods FORCE ROW LEVEL SECURITY;
+
 
 --
 -- Name: customer_balance_snapshots; Type: TABLE; Schema: public; Owner: -
@@ -922,9 +1007,9 @@ CREATE TABLE public.customer_balance_snapshots (
     ledger_account_id uuid NOT NULL,
     snapshot_date date NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
-    balance numeric(20,2) NOT NULL,
-    available_balance numeric(20,2) NOT NULL,
-    held_balance numeric(20,2) DEFAULT 0 NOT NULL,
+    balance bigint NOT NULL,
+    available_balance bigint NOT NULL,
+    held_balance bigint DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
@@ -937,7 +1022,7 @@ CREATE TABLE public.customer_ledger_accounts (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     tenant_id uuid NOT NULL,
     customer_id uuid NOT NULL,
-    user_id uuid NOT NULL,
+    user_id uuid,
     ledger_account_id uuid NOT NULL,
     account_purpose character varying(100) NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
@@ -950,6 +1035,8 @@ CREATE TABLE public.customer_ledger_accounts (
     deleted_at timestamp with time zone
 );
 
+ALTER TABLE ONLY public.customer_ledger_accounts FORCE ROW LEVEL SECURITY;
+
 
 --
 -- Name: journal_entries; Type: TABLE; Schema: public; Owner: -
@@ -961,16 +1048,18 @@ CREATE TABLE public.journal_entries (
     journal_id uuid NOT NULL,
     account_id uuid NOT NULL,
     entry_type public.entry_type NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     entry_sequence integer NOT NULL,
     description text,
     reference character varying(255),
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     created_by uuid,
-    CONSTRAINT journal_entry_amount_chk CHECK ((amount > (0)::numeric)),
+    CONSTRAINT journal_entry_amount_chk CHECK (((amount)::numeric > (0)::numeric)),
     CONSTRAINT journal_entry_sequence_chk CHECK ((entry_sequence > 0))
 );
+
+ALTER TABLE ONLY public.journal_entries FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -999,8 +1088,8 @@ CREATE TABLE public.journals (
     accounting_period_id uuid,
     status public.journal_status DEFAULT 'DRAFT'::public.journal_status NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
-    total_debits numeric(20,2) DEFAULT 0 NOT NULL,
-    total_credits numeric(20,2) DEFAULT 0 NOT NULL,
+    total_debits bigint DEFAULT 0 NOT NULL,
+    total_credits bigint DEFAULT 0 NOT NULL,
     description text,
     posted_at timestamp with time zone,
     posted_by uuid,
@@ -1012,8 +1101,10 @@ CREATE TABLE public.journals (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     created_by uuid,
     updated_by uuid,
-    CONSTRAINT journal_totals_chk CHECK (((total_debits >= (0)::numeric) AND (total_credits >= (0)::numeric)))
+    CONSTRAINT journal_totals_chk CHECK ((((total_debits)::numeric >= (0)::numeric) AND ((total_credits)::numeric >= (0)::numeric)))
 );
+
+ALTER TABLE ONLY public.journals FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1025,18 +1116,20 @@ CREATE TABLE public.ledger_account_balances (
     tenant_id uuid NOT NULL,
     account_id uuid NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
-    posted_debit numeric(20,2) DEFAULT 0 NOT NULL,
-    posted_credit numeric(20,2) DEFAULT 0 NOT NULL,
-    balance numeric(20,2) DEFAULT 0 NOT NULL,
-    available_balance numeric(20,2) DEFAULT 0 NOT NULL,
-    held_balance numeric(20,2) DEFAULT 0 NOT NULL,
+    posted_debit bigint DEFAULT 0 NOT NULL,
+    posted_credit bigint DEFAULT 0 NOT NULL,
+    balance bigint DEFAULT 0 NOT NULL,
+    available_balance bigint DEFAULT 0 NOT NULL,
+    held_balance bigint DEFAULT 0 NOT NULL,
     last_entry_id uuid,
     version bigint DEFAULT 0 NOT NULL,
     calculated_at timestamp with time zone DEFAULT now() NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT balance_amounts_chk CHECK (((posted_debit >= (0)::numeric) AND (posted_credit >= (0)::numeric) AND (held_balance >= (0)::numeric)))
+    CONSTRAINT balance_amounts_chk CHECK ((((posted_debit)::numeric >= (0)::numeric) AND ((posted_credit)::numeric >= (0)::numeric) AND ((held_balance)::numeric >= (0)::numeric)))
 );
+
+ALTER TABLE ONLY public.ledger_account_balances FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1069,17 +1162,17 @@ CREATE TABLE public.ledger_account_limits (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     tenant_id uuid NOT NULL,
     account_id uuid NOT NULL,
-    minimum_balance numeric(20,2),
-    maximum_balance numeric(20,2),
-    daily_debit_limit numeric(20,2),
-    daily_credit_limit numeric(20,2),
-    monthly_debit_limit numeric(20,2),
-    monthly_credit_limit numeric(20,2),
+    minimum_balance bigint,
+    maximum_balance bigint,
+    daily_debit_limit bigint,
+    daily_credit_limit bigint,
+    monthly_debit_limit bigint,
+    monthly_credit_limit bigint,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     is_active boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT account_limits_chk CHECK ((((minimum_balance IS NULL) OR (minimum_balance >= (0)::numeric)) AND ((maximum_balance IS NULL) OR (maximum_balance >= (0)::numeric)) AND ((daily_debit_limit IS NULL) OR (daily_debit_limit >= (0)::numeric)) AND ((daily_credit_limit IS NULL) OR (daily_credit_limit >= (0)::numeric)) AND ((monthly_debit_limit IS NULL) OR (monthly_debit_limit >= (0)::numeric)) AND ((monthly_credit_limit IS NULL) OR (monthly_credit_limit >= (0)::numeric))))
+    CONSTRAINT account_limits_chk CHECK ((((minimum_balance IS NULL) OR ((minimum_balance)::numeric >= (0)::numeric)) AND ((maximum_balance IS NULL) OR ((maximum_balance)::numeric >= (0)::numeric)) AND ((daily_debit_limit IS NULL) OR ((daily_debit_limit)::numeric >= (0)::numeric)) AND ((daily_credit_limit IS NULL) OR ((daily_credit_limit)::numeric >= (0)::numeric)) AND ((monthly_debit_limit IS NULL) OR ((monthly_debit_limit)::numeric >= (0)::numeric)) AND ((monthly_credit_limit IS NULL) OR ((monthly_credit_limit)::numeric >= (0)::numeric))))
 );
 
 
@@ -1155,6 +1248,8 @@ CREATE TABLE public.ledger_accounts (
     CONSTRAINT ledger_account_currency_chk CHECK ((currency_code ~ '^[A-Z]{3}$'::text))
 );
 
+ALTER TABLE ONLY public.ledger_accounts FORCE ROW LEVEL SECURITY;
+
 
 --
 -- Name: ledger_audit_logs; Type: TABLE; Schema: public; Owner: -
@@ -1174,6 +1269,8 @@ CREATE TABLE public.ledger_audit_logs (
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
+
+ALTER TABLE ONLY public.ledger_audit_logs FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1198,12 +1295,37 @@ CREATE TABLE public.ledger_books (
     CONSTRAINT ledger_book_currency_chk CHECK ((base_currency ~ '^[A-Z]{3}$'::text))
 );
 
+ALTER TABLE ONLY public.ledger_books FORCE ROW LEVEL SECURITY;
+
 
 --
 -- Name: TABLE ledger_books; Type: COMMENT; Schema: public; Owner: -
 --
 
 COMMENT ON TABLE public.ledger_books IS 'Accounting books scoped by tenant and legal/accounting entity. All ledger postings belong to exactly one book.';
+
+
+--
+-- Name: ledger_command_idempotency; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ledger_command_idempotency (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    command_type character varying(100) NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    request_hash character(64) NOT NULL,
+    status character varying(20) DEFAULT 'PROCESSING'::character varying NOT NULL,
+    resource_type character varying(100),
+    resource_id uuid,
+    response_body jsonb,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ledger_command_idempotency_status_check CHECK (((status)::text = ANY ((ARRAY['PROCESSING'::character varying, 'COMPLETED'::character varying, 'FAILED'::character varying])::text[])))
+);
+
+ALTER TABLE ONLY public.ledger_command_idempotency FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1268,14 +1390,37 @@ CREATE TABLE public.ledger_fees (
     account_id uuid,
     fee_code character varying(100) NOT NULL,
     fee_description character varying(255),
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
-    tax_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    net_amount numeric(20,2) NOT NULL,
+    tax_amount bigint DEFAULT 0 NOT NULL,
+    net_amount bigint NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT ledger_fee_amount_chk CHECK (((amount >= (0)::numeric) AND (tax_amount >= (0)::numeric) AND (net_amount >= (0)::numeric)))
+    CONSTRAINT ledger_fee_amount_chk CHECK ((((amount)::numeric >= (0)::numeric) AND ((tax_amount)::numeric >= (0)::numeric) AND ((net_amount)::numeric >= (0)::numeric)))
 );
+
+
+--
+-- Name: ledger_hold_actions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.ledger_hold_actions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    hold_id uuid NOT NULL,
+    action_type character varying(20) NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    request_hash character(64) NOT NULL,
+    status character varying(20) DEFAULT 'PROCESSING'::character varying NOT NULL,
+    transaction_id uuid,
+    response_body jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ledger_hold_actions_action_type_check CHECK (((action_type)::text = ANY ((ARRAY['RELEASE'::character varying, 'CAPTURE'::character varying])::text[]))),
+    CONSTRAINT ledger_hold_actions_status_check CHECK (((status)::text = ANY ((ARRAY['PROCESSING'::character varying, 'COMPLETED'::character varying, 'FAILED'::character varying])::text[])))
+);
+
+ALTER TABLE ONLY public.ledger_hold_actions FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1303,9 +1448,15 @@ CREATE TABLE public.ledger_inbox_events (
     last_error text,
     ledger_transaction_id uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    available_at timestamp with time zone DEFAULT now() NOT NULL,
+    lease_expires_at timestamp with time zone,
+    processed_by character varying(100),
+    payload_hash character(64) NOT NULL,
     CONSTRAINT ledger_inbox_retry_chk CHECK ((retry_count >= 0)),
     CONSTRAINT ledger_inbox_version_chk CHECK ((event_version > 0))
 );
+
+ALTER TABLE ONLY public.ledger_inbox_events FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1327,13 +1478,19 @@ CREATE TABLE public.ledger_integrity_checks (
     status character varying(30) NOT NULL,
     records_checked bigint DEFAULT 0 NOT NULL,
     records_failed bigint DEFAULT 0 NOT NULL,
-    total_debits numeric(20,2) DEFAULT 0 NOT NULL,
-    total_credits numeric(20,2) DEFAULT 0 NOT NULL,
-    discrepancy_amount numeric(20,2) DEFAULT 0 NOT NULL,
+    total_debits bigint DEFAULT 0 NOT NULL,
+    total_credits bigint DEFAULT 0 NOT NULL,
+    discrepancy_amount bigint DEFAULT 0 NOT NULL,
     failure_details jsonb DEFAULT '{}'::jsonb NOT NULL,
     executed_at timestamp with time zone DEFAULT now() NOT NULL,
+    run_reference character varying(100) NOT NULL,
+    request_hash character(64) NOT NULL,
+    worker_id character varying(100),
+    started_at timestamp with time zone,
     CONSTRAINT integrity_records_chk CHECK (((records_checked >= 0) AND (records_failed >= 0)))
 );
+
+ALTER TABLE ONLY public.ledger_integrity_checks FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1348,48 +1505,15 @@ CREATE TABLE public.ledger_interest_entries (
     source_service character varying(100) NOT NULL,
     source_reference character varying(255),
     interest_type character varying(50) NOT NULL,
-    principal_amount numeric(20,2) NOT NULL,
+    principal_amount bigint NOT NULL,
     interest_rate numeric(12,6),
-    interest_amount numeric(20,2) NOT NULL,
+    interest_amount bigint NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     accrual_date date NOT NULL,
     posted_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT interest_amount_chk CHECK (((principal_amount >= (0)::numeric) AND (interest_amount >= (0)::numeric)))
+    CONSTRAINT interest_amount_chk CHECK ((((principal_amount)::numeric >= (0)::numeric) AND ((interest_amount)::numeric >= (0)::numeric)))
 );
-
-
---
--- Name: ledger_outbox_events; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.ledger_outbox_events (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    tenant_id uuid NOT NULL,
-    aggregate_type character varying(100) NOT NULL,
-    aggregate_id uuid NOT NULL,
-    event_type character varying(150) NOT NULL,
-    event_version integer DEFAULT 1 NOT NULL,
-    payload jsonb NOT NULL,
-    idempotency_key character varying(255),
-    correlation_id uuid,
-    causation_id uuid,
-    status public.ledger_outbox_status DEFAULT 'PENDING'::public.ledger_outbox_status NOT NULL,
-    retry_count integer DEFAULT 0 NOT NULL,
-    available_at timestamp with time zone DEFAULT now() NOT NULL,
-    published_at timestamp with time zone,
-    last_error text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT ledger_outbox_retry_chk CHECK ((retry_count >= 0)),
-    CONSTRAINT ledger_outbox_version_chk CHECK ((event_version > 0))
-);
-
-
---
--- Name: TABLE ledger_outbox_events; Type: COMMENT; Schema: public; Owner: -
---
-
-COMMENT ON TABLE public.ledger_outbox_events IS 'Transactional outbox used to publish ledger posting/reversal/completion events after accounting changes commit.';
 
 
 --
@@ -1403,13 +1527,13 @@ CREATE TABLE public.ledger_snapshots (
     snapshot_date date NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     account_count bigint DEFAULT 0 NOT NULL,
-    total_debits numeric(20,2) DEFAULT 0 NOT NULL,
-    total_credits numeric(20,2) DEFAULT 0 NOT NULL,
-    total_assets numeric(20,2) DEFAULT 0 NOT NULL,
-    total_liabilities numeric(20,2) DEFAULT 0 NOT NULL,
-    total_equity numeric(20,2) DEFAULT 0 NOT NULL,
-    total_income numeric(20,2) DEFAULT 0 NOT NULL,
-    total_expenses numeric(20,2) DEFAULT 0 NOT NULL,
+    total_debits bigint DEFAULT 0 NOT NULL,
+    total_credits bigint DEFAULT 0 NOT NULL,
+    total_assets bigint DEFAULT 0 NOT NULL,
+    total_liabilities bigint DEFAULT 0 NOT NULL,
+    total_equity bigint DEFAULT 0 NOT NULL,
+    total_income bigint DEFAULT 0 NOT NULL,
+    total_expenses bigint DEFAULT 0 NOT NULL,
     snapshot_data jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT ledger_snapshot_counts_chk CHECK ((account_count >= 0))
@@ -1426,13 +1550,13 @@ CREATE TABLE public.ledger_tax_entries (
     transaction_id uuid,
     account_id uuid NOT NULL,
     tax_code character varying(50) NOT NULL,
-    taxable_amount numeric(20,2) NOT NULL,
+    taxable_amount bigint NOT NULL,
     tax_rate numeric(12,6),
-    tax_amount numeric(20,2) NOT NULL,
+    tax_amount bigint NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     tax_date date NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT tax_amount_chk CHECK (((taxable_amount >= (0)::numeric) AND (tax_amount >= (0)::numeric)))
+    CONSTRAINT tax_amount_chk CHECK ((((taxable_amount)::numeric >= (0)::numeric) AND ((tax_amount)::numeric >= (0)::numeric)))
 );
 
 
@@ -1450,8 +1574,12 @@ CREATE TABLE public.ledger_tenant_accounts (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     created_by uuid,
-    updated_by uuid
+    updated_by uuid,
+    currency_code character(3) NOT NULL,
+    CONSTRAINT ledger_tenant_accounts_currency_code_check CHECK ((currency_code ~ '^[A-Z]{3}$'::text))
 );
+
+ALTER TABLE ONLY public.ledger_tenant_accounts FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1478,9 +1606,9 @@ CREATE TABLE public.ledger_transactions (
     transaction_reference character varying(100) NOT NULL,
     transaction_type public.transaction_type NOT NULL,
     status public.transaction_status DEFAULT 'PENDING'::public.transaction_status NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
-    idempotency_key character varying(255),
+    idempotency_key character varying(255) NOT NULL,
     source_service character varying(100) NOT NULL,
     source_reference character varying(255),
     source_event_type character varying(150),
@@ -1505,9 +1633,12 @@ CREATE TABLE public.ledger_transactions (
     failed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT ledger_transaction_amount_chk CHECK ((amount >= (0)::numeric)),
+    request_hash character(64) NOT NULL,
+    CONSTRAINT ledger_transaction_amount_chk CHECK (((amount)::numeric >= (0)::numeric)),
     CONSTRAINT ledger_transaction_currency_chk CHECK ((currency_code ~ '^[A-Z]{3}$'::text))
 );
+
+ALTER TABLE ONLY public.ledger_transactions FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1568,14 +1699,14 @@ CREATE TABLE public.posting_batches (
     source_service character varying(100) NOT NULL,
     status public.journal_status DEFAULT 'PENDING'::public.journal_status NOT NULL,
     total_entries integer DEFAULT 0 NOT NULL,
-    total_amount numeric(20,2) DEFAULT 0 NOT NULL,
+    total_amount bigint DEFAULT 0 NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     started_at timestamp with time zone DEFAULT now() NOT NULL,
     completed_at timestamp with time zone,
     error_message text,
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT posting_batch_amount_chk CHECK ((total_amount >= (0)::numeric)),
+    CONSTRAINT posting_batch_amount_chk CHECK (((total_amount)::numeric >= (0)::numeric)),
     CONSTRAINT posting_batch_entries_chk CHECK ((total_entries >= 0))
 );
 
@@ -1599,6 +1730,8 @@ CREATE TABLE public.reconciliation_exceptions (
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
+ALTER TABLE ONLY public.reconciliation_exceptions FORCE ROW LEVEL SECURITY;
+
 
 --
 -- Name: reconciliation_items; Type: TABLE; Schema: public; Owner: -
@@ -1610,14 +1743,18 @@ CREATE TABLE public.reconciliation_items (
     reconciliation_run_id uuid NOT NULL,
     transaction_id uuid,
     external_reference character varying(255),
-    source_amount numeric(20,2),
-    ledger_amount numeric(20,2),
+    source_amount bigint,
+    ledger_amount bigint,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     status public.reconciliation_item_status DEFAULT 'UNMATCHED'::public.reconciliation_item_status NOT NULL,
-    difference_amount numeric(20,2) DEFAULT 0 NOT NULL,
+    difference_amount bigint DEFAULT 0 NOT NULL,
     matched_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    source_payload_hash character(64) NOT NULL,
+    idempotency_key character varying(255) NOT NULL
 );
+
+ALTER TABLE ONLY public.reconciliation_items FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1635,13 +1772,18 @@ CREATE TABLE public.reconciliation_runs (
     matched_records integer DEFAULT 0 NOT NULL,
     unmatched_records integer DEFAULT 0 NOT NULL,
     exception_records integer DEFAULT 0 NOT NULL,
-    total_source_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    total_ledger_amount numeric(20,2) DEFAULT 0 NOT NULL,
+    total_source_amount bigint DEFAULT 0 NOT NULL,
+    total_ledger_amount bigint DEFAULT 0 NOT NULL,
     started_at timestamp with time zone,
     completed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    source_payload_hash character(64) NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    source_metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT reconciliation_counts_chk CHECK (((total_records >= 0) AND (matched_records >= 0) AND (unmatched_records >= 0) AND (exception_records >= 0)))
 );
+
+ALTER TABLE ONLY public.reconciliation_runs FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1657,15 +1799,15 @@ CREATE TABLE public.settlement_batches (
     payment_id uuid,
     platform_revenue_settlement_id uuid,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
-    gross_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    fee_amount numeric(20,2) DEFAULT 0 NOT NULL,
-    net_amount numeric(20,2) DEFAULT 0 NOT NULL,
+    gross_amount bigint DEFAULT 0 NOT NULL,
+    fee_amount bigint DEFAULT 0 NOT NULL,
+    net_amount bigint DEFAULT 0 NOT NULL,
     status public.settlement_status DEFAULT 'PENDING'::public.settlement_status NOT NULL,
     settlement_date date,
     initiated_at timestamp with time zone DEFAULT now() NOT NULL,
     completed_at timestamp with time zone,
     metadata jsonb DEFAULT '{}'::jsonb NOT NULL,
-    CONSTRAINT settlement_amount_chk CHECK (((gross_amount >= (0)::numeric) AND (fee_amount >= (0)::numeric) AND (net_amount >= (0)::numeric) AND (net_amount = (gross_amount - fee_amount))))
+    CONSTRAINT settlement_amount_chk CHECK ((((gross_amount)::numeric >= (0)::numeric) AND ((fee_amount)::numeric >= (0)::numeric) AND ((net_amount)::numeric >= (0)::numeric) AND ((net_amount)::numeric = ((gross_amount)::numeric - (fee_amount)::numeric))))
 );
 
 
@@ -1679,12 +1821,12 @@ CREATE TABLE public.settlement_entries (
     settlement_batch_id uuid NOT NULL,
     transaction_id uuid,
     external_reference character varying(255),
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     status public.settlement_status DEFAULT 'PENDING'::public.settlement_status NOT NULL,
     settled_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT settlement_entry_amount_chk CHECK ((amount > (0)::numeric))
+    CONSTRAINT settlement_entry_amount_chk CHECK (((amount)::numeric > (0)::numeric))
 );
 
 
@@ -1697,7 +1839,7 @@ CREATE TABLE public.transaction_adjustments (
     tenant_id uuid NOT NULL,
     transaction_id uuid,
     adjustment_reference character varying(100) NOT NULL,
-    amount numeric(20,2) NOT NULL,
+    amount bigint NOT NULL,
     currency_code character(3) DEFAULT 'NGN'::bpchar NOT NULL,
     reason text NOT NULL,
     status public.adjustment_status DEFAULT 'PENDING'::public.adjustment_status NOT NULL,
@@ -1708,8 +1850,14 @@ CREATE TABLE public.transaction_adjustments (
     rejected_reason text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT adjustment_amount_chk CHECK ((amount > (0)::numeric))
+    approval_id uuid NOT NULL,
+    idempotency_key character varying(255) NOT NULL,
+    request_hash character(64) NOT NULL,
+    posted_transaction_id uuid,
+    CONSTRAINT adjustment_amount_chk CHECK (((amount)::numeric > (0)::numeric))
 );
+
+ALTER TABLE ONLY public.transaction_adjustments FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1726,6 +1874,8 @@ CREATE TABLE public.transaction_links (
     CONSTRAINT transaction_link_self_chk CHECK ((transaction_id <> linked_transaction_id))
 );
 
+ALTER TABLE ONLY public.transaction_links FORCE ROW LEVEL SECURITY;
+
 
 --
 -- Name: transaction_reversals; Type: TABLE; Schema: public; Owner: -
@@ -1738,8 +1888,15 @@ CREATE TABLE public.transaction_reversals (
     reversal_transaction_id uuid NOT NULL,
     reason text NOT NULL,
     initiated_by uuid,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    approval_id uuid,
+    idempotency_key character varying(255) NOT NULL,
+    request_hash character(64) NOT NULL,
+    source_service character varying(100) NOT NULL,
+    completed_at timestamp with time zone
 );
+
+ALTER TABLE ONLY public.transaction_reversals FORCE ROW LEVEL SECURITY;
 
 
 --
@@ -1879,6 +2036,14 @@ ALTER TABLE ONLY public.ledger_books
 
 
 --
+-- Name: ledger_command_idempotency ledger_command_idempotency_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ledger_command_idempotency
+    ADD CONSTRAINT ledger_command_idempotency_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: ledger_control_accounts ledger_control_accounts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1900,6 +2065,14 @@ ALTER TABLE ONLY public.ledger_entities
 
 ALTER TABLE ONLY public.ledger_fees
     ADD CONSTRAINT ledger_fees_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: ledger_hold_actions ledger_hold_actions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ledger_hold_actions
+    ADD CONSTRAINT ledger_hold_actions_pkey PRIMARY KEY (id);
 
 
 --
@@ -2111,6 +2284,22 @@ ALTER TABLE ONLY public.accounting_periods
 
 
 --
+-- Name: transaction_adjustments uq_adjustment_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.transaction_adjustments
+    ADD CONSTRAINT uq_adjustment_idempotency UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: transaction_adjustments uq_adjustment_posted_transaction; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.transaction_adjustments
+    ADD CONSTRAINT uq_adjustment_posted_transaction UNIQUE (posted_transaction_id);
+
+
+--
 -- Name: transaction_adjustments uq_adjustment_reference; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2151,6 +2340,14 @@ ALTER TABLE ONLY public.customer_ledger_accounts
 
 
 --
+-- Name: ledger_integrity_checks uq_integrity_check_run; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ledger_integrity_checks
+    ADD CONSTRAINT uq_integrity_check_run UNIQUE (tenant_id, check_type, run_reference);
+
+
+--
 -- Name: journal_entries uq_journal_entry_sequence; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2164,6 +2361,14 @@ ALTER TABLE ONLY public.journal_entries
 
 ALTER TABLE ONLY public.journals
     ADD CONSTRAINT uq_journal_reference UNIQUE (book_id, journal_reference);
+
+
+--
+-- Name: journals uq_journal_transaction; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.journals
+    ADD CONSTRAINT uq_journal_transaction UNIQUE (transaction_id);
 
 
 --
@@ -2191,11 +2396,27 @@ ALTER TABLE ONLY public.ledger_books
 
 
 --
+-- Name: ledger_command_idempotency uq_ledger_command_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ledger_command_idempotency
+    ADD CONSTRAINT uq_ledger_command_idempotency UNIQUE (tenant_id, command_type, idempotency_key);
+
+
+--
 -- Name: ledger_entities uq_ledger_entity_code; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.ledger_entities
     ADD CONSTRAINT uq_ledger_entity_code UNIQUE (entity_code);
+
+
+--
+-- Name: ledger_hold_actions uq_ledger_hold_action_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ledger_hold_actions
+    ADD CONSTRAINT uq_ledger_hold_action_idempotency UNIQUE (tenant_id, action_type, idempotency_key);
 
 
 --
@@ -2255,6 +2476,30 @@ ALTER TABLE ONLY public.posting_batches
 
 
 --
+-- Name: reconciliation_exceptions uq_reconciliation_exception_code; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reconciliation_exceptions
+    ADD CONSTRAINT uq_reconciliation_exception_code UNIQUE (reconciliation_item_id, exception_code);
+
+
+--
+-- Name: reconciliation_runs uq_reconciliation_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reconciliation_runs
+    ADD CONSTRAINT uq_reconciliation_idempotency UNIQUE (tenant_id, source_system, idempotency_key);
+
+
+--
+-- Name: reconciliation_items uq_reconciliation_item_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.reconciliation_items
+    ADD CONSTRAINT uq_reconciliation_item_idempotency UNIQUE (reconciliation_run_id, idempotency_key);
+
+
+--
 -- Name: reconciliation_runs uq_reconciliation_run; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2271,11 +2516,11 @@ ALTER TABLE ONLY public.settlement_batches
 
 
 --
--- Name: ledger_tenant_accounts uq_tenant_account_purpose; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: ledger_tenant_accounts uq_tenant_account_purpose_currency; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.ledger_tenant_accounts
-    ADD CONSTRAINT uq_tenant_account_purpose UNIQUE (tenant_id, purpose);
+    ADD CONSTRAINT uq_tenant_account_purpose_currency UNIQUE (tenant_id, purpose, currency_code);
 
 
 --
@@ -2300,6 +2545,22 @@ ALTER TABLE ONLY public.transaction_links
 
 ALTER TABLE ONLY public.transaction_reversals
     ADD CONSTRAINT uq_transaction_reversal UNIQUE (original_transaction_id);
+
+
+--
+-- Name: transaction_reversals uq_transaction_reversal_idempotency; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.transaction_reversals
+    ADD CONSTRAINT uq_transaction_reversal_idempotency UNIQUE (tenant_id, idempotency_key);
+
+
+--
+-- Name: transaction_reversals uq_transaction_reversal_original; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.transaction_reversals
+    ADD CONSTRAINT uq_transaction_reversal_original UNIQUE (original_transaction_id);
 
 
 --
@@ -2328,6 +2589,13 @@ CREATE INDEX idx_account_holds_account ON public.account_holds USING btree (acco
 --
 
 CREATE INDEX idx_account_holds_active ON public.account_holds USING btree (tenant_id, status) WHERE (status = 'ACTIVE'::public.hold_status);
+
+
+--
+-- Name: idx_account_holds_expiry_active; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_account_holds_expiry_active ON public.account_holds USING btree (expires_at) WHERE ((status = 'ACTIVE'::public.hold_status) AND (expires_at IS NOT NULL));
 
 
 --
@@ -2398,6 +2666,13 @@ CREATE INDEX idx_integrity_checks_date ON public.ledger_integrity_checks USING b
 --
 
 CREATE INDEX idx_integrity_checks_status ON public.ledger_integrity_checks USING btree (tenant_id, status);
+
+
+--
+-- Name: idx_integrity_run_reference; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_integrity_run_reference ON public.ledger_integrity_checks USING btree (tenant_id, check_type, run_reference);
 
 
 --
@@ -2569,6 +2844,13 @@ CREATE INDEX idx_ledger_books_tenant ON public.ledger_books USING btree (tenant_
 
 
 --
+-- Name: idx_ledger_command_idempotency_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ledger_command_idempotency_expiry ON public.ledger_command_idempotency USING btree (expires_at);
+
+
+--
 -- Name: idx_ledger_entities_platform; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -2604,10 +2886,24 @@ CREATE INDEX idx_ledger_fees_transaction ON public.ledger_fees USING btree (tran
 
 
 --
+-- Name: idx_ledger_hold_actions_hold; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ledger_hold_actions_hold ON public.ledger_hold_actions USING btree (tenant_id, hold_id);
+
+
+--
 -- Name: idx_ledger_inbox_correlation; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX idx_ledger_inbox_correlation ON public.ledger_inbox_events USING btree (correlation_id) WHERE (correlation_id IS NOT NULL);
+
+
+--
+-- Name: idx_ledger_inbox_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ledger_inbox_due ON public.ledger_inbox_events USING btree (available_at, lease_expires_at) WHERE (status = ANY (ARRAY['RECEIVED'::public.ledger_event_status, 'FAILED'::public.ledger_event_status, 'PROCESSING'::public.ledger_event_status]));
 
 
 --
@@ -2629,6 +2925,13 @@ CREATE INDEX idx_ledger_outbox_aggregate ON public.ledger_outbox_events USING bt
 --
 
 CREATE INDEX idx_ledger_outbox_correlation ON public.ledger_outbox_events USING btree (correlation_id) WHERE (correlation_id IS NOT NULL);
+
+
+--
+-- Name: idx_ledger_outbox_lease; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_ledger_outbox_lease ON public.ledger_outbox_events USING btree (lease_expires_at) WHERE (status = 'PENDING'::public.ledger_outbox_status);
 
 
 --
@@ -2793,6 +3096,13 @@ CREATE INDEX idx_reconciliation_exceptions_status ON public.reconciliation_excep
 
 
 --
+-- Name: idx_reconciliation_item_idempotency; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_reconciliation_item_idempotency ON public.reconciliation_items USING btree (reconciliation_run_id, idempotency_key);
+
+
+--
 -- Name: idx_reconciliation_items_external; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -2888,6 +3198,13 @@ CREATE INDEX idx_tax_entries_date ON public.ledger_tax_entries USING btree (tena
 --
 
 CREATE INDEX idx_tax_entries_transaction ON public.ledger_tax_entries USING btree (transaction_id);
+
+
+--
+-- Name: idx_transaction_adjustments_approval; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_transaction_adjustments_approval ON public.transaction_adjustments USING btree (tenant_id, approval_id);
 
 
 --
@@ -3038,10 +3355,38 @@ CREATE TRIGGER trg_ledger_transactions_updated_at BEFORE UPDATE ON public.ledger
 
 
 --
--- Name: journal_entries trg_prevent_posted_entry_update; Type: TRIGGER; Schema: public; Owner: -
+-- Name: account_holds trg_prevent_account_hold_lifecycle_change; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER trg_prevent_posted_entry_update BEFORE DELETE OR UPDATE ON public.journal_entries FOR EACH ROW EXECUTE FUNCTION public.prevent_posted_journal_entry_change();
+CREATE TRIGGER trg_prevent_account_hold_lifecycle_change BEFORE DELETE OR UPDATE ON public.account_holds FOR EACH ROW EXECUTE FUNCTION public.prevent_account_hold_lifecycle_change();
+
+
+--
+-- Name: ledger_integrity_checks trg_prevent_completed_integrity_change; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_prevent_completed_integrity_change BEFORE DELETE OR UPDATE ON public.ledger_integrity_checks FOR EACH ROW EXECUTE FUNCTION public.prevent_completed_integrity_evidence_change();
+
+
+--
+-- Name: ledger_transactions trg_prevent_completed_transaction_change; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_prevent_completed_transaction_change BEFORE DELETE OR UPDATE ON public.ledger_transactions FOR EACH ROW EXECUTE FUNCTION public.prevent_completed_ledger_transaction_change();
+
+
+--
+-- Name: transaction_adjustments trg_prevent_posted_adjustment_change; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_prevent_posted_adjustment_change BEFORE DELETE OR UPDATE ON public.transaction_adjustments FOR EACH ROW WHEN ((old.status = 'POSTED'::public.adjustment_status)) EXECUTE FUNCTION public.prevent_financial_link_change();
+
+
+--
+-- Name: journal_entries trg_prevent_posted_entry_change; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_prevent_posted_entry_change BEFORE INSERT OR DELETE OR UPDATE ON public.journal_entries FOR EACH ROW EXECUTE FUNCTION public.prevent_posted_journal_entry_change();
 
 
 --
@@ -3059,6 +3404,13 @@ CREATE TRIGGER trg_prevent_posted_journal_update BEFORE UPDATE ON public.journal
 
 
 --
+-- Name: transaction_reversals trg_prevent_transaction_reversal_change; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_prevent_transaction_reversal_change BEFORE DELETE OR UPDATE ON public.transaction_reversals FOR EACH ROW EXECUTE FUNCTION public.prevent_financial_link_change();
+
+
+--
 -- Name: reconciliation_exceptions trg_reconciliation_exceptions_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -3066,10 +3418,31 @@ CREATE TRIGGER trg_reconciliation_exceptions_updated_at BEFORE UPDATE ON public.
 
 
 --
+-- Name: account_holds trg_refresh_balance_for_account_hold; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_refresh_balance_for_account_hold AFTER INSERT OR UPDATE OF status, amount, expires_at ON public.account_holds FOR EACH ROW EXECUTE FUNCTION public.refresh_balance_for_account_hold();
+
+
+--
 -- Name: transaction_adjustments trg_transaction_adjustments_updated_at; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER trg_transaction_adjustments_updated_at BEFORE UPDATE ON public.transaction_adjustments FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+
+--
+-- Name: account_holds trg_validate_account_hold_scope; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_validate_account_hold_scope BEFORE INSERT OR UPDATE ON public.account_holds FOR EACH ROW EXECUTE FUNCTION public.validate_account_hold_scope();
+
+
+--
+-- Name: customer_ledger_accounts trg_validate_customer_ledger_account_scope; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_validate_customer_ledger_account_scope BEFORE INSERT OR UPDATE ON public.customer_ledger_accounts FOR EACH ROW EXECUTE FUNCTION public.validate_customer_ledger_account_scope();
 
 
 --
@@ -3094,10 +3467,38 @@ CREATE TRIGGER trg_validate_ledger_book_entity_scope BEFORE INSERT OR UPDATE ON 
 
 
 --
+-- Name: ledger_inbox_events trg_validate_ledger_inbox_transition; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_validate_ledger_inbox_transition BEFORE UPDATE ON public.ledger_inbox_events FOR EACH ROW EXECUTE FUNCTION public.validate_ledger_inbox_transition();
+
+
+--
+-- Name: ledger_outbox_events trg_validate_ledger_outbox_transition; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_validate_ledger_outbox_transition BEFORE UPDATE ON public.ledger_outbox_events FOR EACH ROW EXECUTE FUNCTION public.validate_ledger_outbox_transition();
+
+
+--
 -- Name: ledger_transactions trg_validate_ledger_transaction_book_scope; Type: TRIGGER; Schema: public; Owner: -
 --
 
 CREATE TRIGGER trg_validate_ledger_transaction_book_scope BEFORE INSERT OR UPDATE ON public.ledger_transactions FOR EACH ROW EXECUTE FUNCTION public.validate_ledger_transaction_book_scope();
+
+
+--
+-- Name: ledger_tenant_accounts trg_validate_tenant_ledger_account_scope; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_validate_tenant_ledger_account_scope BEFORE INSERT OR UPDATE ON public.ledger_tenant_accounts FOR EACH ROW EXECUTE FUNCTION public.validate_tenant_ledger_account_scope();
+
+
+--
+-- Name: transaction_reversals trg_validate_transaction_reversal_scope; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER trg_validate_transaction_reversal_scope BEFORE INSERT ON public.transaction_reversals FOR EACH ROW EXECUTE FUNCTION public.validate_transaction_reversal_scope();
 
 
 --
@@ -3117,6 +3518,14 @@ ALTER TABLE ONLY public.account_holds
 
 
 --
+-- Name: account_holds fk_account_hold_capture_transaction; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.account_holds
+    ADD CONSTRAINT fk_account_hold_capture_transaction FOREIGN KEY (capture_transaction_id) REFERENCES public.ledger_transactions(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: ledger_account_limits fk_account_limits_account; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3130,6 +3539,14 @@ ALTER TABLE ONLY public.ledger_account_limits
 
 ALTER TABLE ONLY public.accounting_periods
     ADD CONSTRAINT fk_accounting_period_book FOREIGN KEY (book_id) REFERENCES public.ledger_books(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: transaction_adjustments fk_adjustment_posted_transaction; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.transaction_adjustments
+    ADD CONSTRAINT fk_adjustment_posted_transaction FOREIGN KEY (posted_transaction_id) REFERENCES public.ledger_transactions(id) ON DELETE RESTRICT;
 
 
 --
@@ -3517,6 +3934,22 @@ ALTER TABLE ONLY public.transaction_links
 
 
 --
+-- Name: ledger_hold_actions ledger_hold_actions_hold_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ledger_hold_actions
+    ADD CONSTRAINT ledger_hold_actions_hold_id_fkey FOREIGN KEY (hold_id) REFERENCES public.account_holds(id) ON DELETE RESTRICT;
+
+
+--
+-- Name: ledger_hold_actions ledger_hold_actions_transaction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.ledger_hold_actions
+    ADD CONSTRAINT ledger_hold_actions_transaction_id_fkey FOREIGN KEY (transaction_id) REFERENCES public.ledger_transactions(id) ON DELETE RESTRICT;
+
+
+--
 -- Name: account_hold_releases; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -3705,6 +4138,19 @@ CREATE POLICY ledger_categories_tenant_policy ON public.ledger_account_categorie
 
 
 --
+-- Name: ledger_command_idempotency; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.ledger_command_idempotency ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: ledger_command_idempotency ledger_command_idempotency_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY ledger_command_idempotency_policy ON public.ledger_command_idempotency USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
 -- Name: ledger_control_accounts; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -3741,6 +4187,19 @@ ALTER TABLE public.ledger_fees ENABLE ROW LEVEL SECURITY;
 --
 
 CREATE POLICY ledger_fees_policy ON public.ledger_fees USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
+
+
+--
+-- Name: ledger_hold_actions; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.ledger_hold_actions ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: ledger_hold_actions ledger_hold_actions_tenant_policy; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY ledger_hold_actions_tenant_policy ON public.ledger_hold_actions USING ((tenant_id = public.current_tenant_id())) WITH CHECK ((tenant_id = public.current_tenant_id()));
 
 
 --
