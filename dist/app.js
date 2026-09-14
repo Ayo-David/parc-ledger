@@ -14,10 +14,7 @@ export function createApp(input) {
     }));
     app.post("/internal/v1/postings", async (req, res, next) => {
         try {
-            const token = req.header("x-internal-service-token") ?? "";
-            if (token.length !== input.config.INTERNAL_SERVICE_TOKEN.length ||
-                !timingSafeEqual(Buffer.from(token), Buffer.from(input.config.INTERNAL_SERVICE_TOKEN)))
-                throw new PostingError("UNAUTHORIZED", "Internal service authentication required");
+            authenticate(req.header("x-internal-service-token") ?? "", input.config.INTERNAL_SERVICE_TOKEN);
             const tenantId = req.header("x-tenant-id");
             const idempotencyKey = req.header("idempotency-key");
             const sourceService = req.header("x-calling-service");
@@ -32,11 +29,7 @@ export function createApp(input) {
                 tenantId,
                 reference: body.reference,
                 currency: body.currency,
-                entries: body.entries.map((e) => ({
-                    accountId: String(e.account_id),
-                    direction: e.direction,
-                    amountMinor: String(e.amount_minor),
-                })),
+                entries: mapEntries(body.entries),
                 idempotencyKey,
                 sourceService,
                 correlationId: req.header("x-correlation-id") ?? crypto.randomUUID(),
@@ -78,6 +71,71 @@ export function createApp(input) {
                 .status(result.replayed ? 200 : 201)
                 .setHeader("Idempotent-Replayed", String(result.replayed))
                 .json(result);
+        }
+        catch (error) {
+            next(error);
+        }
+    });
+    app.get("/internal/v1/accounts/:id/balance", async (req, res, next) => {
+        try {
+            const context = internalReadContext(req, input.config.INTERNAL_SERVICE_TOKEN);
+            res.json(await input.balances.byAccount({
+                tenantId: context.tenantId,
+                accountId: req.params.id,
+            }));
+        }
+        catch (error) {
+            next(error);
+        }
+    });
+    app.get("/internal/v1/customers/:customerId/wallet-balance", async (req, res, next) => {
+        try {
+            const context = internalReadContext(req, input.config.INTERNAL_SERVICE_TOKEN);
+            res.json(await input.balances.customerWallet({
+                tenantId: context.tenantId,
+                customerId: req.params.customerId,
+                currency: typeof req.query.currency === "string" ? req.query.currency : "",
+            }));
+        }
+        catch (error) {
+            next(error);
+        }
+    });
+    app.post("/internal/v1/customers/:customerId/statements", async (req, res, next) => {
+        try {
+            const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
+            const body = req.body;
+            if (typeof body.date_from !== "string" ||
+                typeof body.date_to !== "string" ||
+                body.format !== "pdf" ||
+                (body.currency !== undefined && typeof body.currency !== "string"))
+                throw new PostingError("REQUEST_INVALID", "Invalid statement request");
+            const result = await input.statements.request({
+                tenantId: context.tenantId,
+                customerId: req.params.customerId,
+                currency: body.currency ?? "NGN",
+                dateFrom: body.date_from,
+                dateTo: body.date_to,
+                format: "PDF",
+                idempotencyKey: context.idempotencyKey,
+            });
+            res
+                .status(result.replayed ? 200 : 202)
+                .setHeader("Idempotent-Replayed", String(result.replayed))
+                .json(result);
+        }
+        catch (error) {
+            next(error);
+        }
+    });
+    app.get("/internal/v1/customers/:customerId/statements/:statementId", async (req, res, next) => {
+        try {
+            const context = internalReadContext(req, input.config.INTERNAL_SERVICE_TOKEN);
+            res.json(await input.statements.get({
+                tenantId: context.tenantId,
+                customerId: req.params.customerId,
+                statementId: req.params.statementId,
+            }));
         }
         catch (error) {
             next(error);
@@ -147,11 +205,7 @@ export function createApp(input) {
                 sourceService: context.sourceService,
                 correlationId: context.correlationId,
                 reference: body.reference,
-                entries: body.entries.map((entry) => ({
-                    accountId: String(entry.account_id),
-                    direction: entry.direction,
-                    amountMinor: String(entry.amount_minor),
-                })),
+                entries: mapEntries(body.entries),
             });
             res
                 .status(result.replayed ? 200 : 201)
@@ -211,11 +265,7 @@ export function createApp(input) {
                 reference: body.reference,
                 currency: body.currency,
                 reason: body.reason,
-                entries: body.entries.map((entry) => ({
-                    accountId: String(entry.account_id),
-                    direction: entry.direction,
-                    amountMinor: String(entry.amount_minor),
-                })),
+                entries: mapEntries(body.entries),
                 idempotencyKey: context.idempotencyKey,
                 sourceService: context.sourceService,
                 correlationId: context.correlationId,
@@ -235,11 +285,13 @@ export function createApp(input) {
         res
             .status(error instanceof PostingError && error.code === "UNAUTHORIZED"
             ? 401
-            : error instanceof PostingError && error.code.includes("INVALID")
-                ? 422
-                : error instanceof PostingError
-                    ? 409
-                    : 500)
+            : error instanceof PostingError && error.code.endsWith("NOT_FOUND")
+                ? 404
+                : error instanceof PostingError && error.code.includes("INVALID")
+                    ? 422
+                    : error instanceof PostingError
+                        ? 409
+                        : 500)
             .json({
             code: known ? error.code : "INTERNAL_ERROR",
             message: known ? error.message : "An internal error occurred",
@@ -247,8 +299,16 @@ export function createApp(input) {
     });
     return app;
 }
+function internalReadContext(req, expectedToken) {
+    authenticate(req.header("x-internal-service-token") ?? "", expectedToken);
+    const tenantId = req.header("x-tenant-id");
+    const sourceService = req.header("x-calling-service");
+    if (!tenantId || !sourceService)
+        throw new PostingError("REQUEST_INVALID", "Tenant and calling service are required");
+    return { tenantId, sourceService };
+}
 function authenticate(token, expected) {
-    if (token.length !== expected.length ||
+    if (Buffer.byteLength(token) !== Buffer.byteLength(expected) ||
         !timingSafeEqual(Buffer.from(token), Buffer.from(expected)))
         throw new PostingError("UNAUTHORIZED", "Internal service authentication required");
 }
@@ -263,4 +323,22 @@ function internalContext(req, expectedToken) {
         sourceService,
         correlationId: req.header("x-correlation-id") ?? crypto.randomUUID(),
     };
+}
+function mapEntries(entries) {
+    if (!Array.isArray(entries))
+        throw new PostingError("REQUEST_INVALID", "Entries must be an array");
+    return entries.map((entry) => {
+        if (entry === null ||
+            typeof entry !== "object" ||
+            typeof entry.account_id !== "string" ||
+            !["DEBIT", "CREDIT"].includes(entry.direction) ||
+            typeof entry.amount_minor !== "string")
+            throw new PostingError("REQUEST_INVALID", "Invalid posting entry");
+        const value = entry;
+        return {
+            accountId: value.account_id,
+            direction: value.direction,
+            amountMinor: value.amount_minor,
+        };
+    });
 }

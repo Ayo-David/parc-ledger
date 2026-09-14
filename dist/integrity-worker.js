@@ -16,8 +16,14 @@ async function runChecks() {
         return;
     running = true;
     try {
-        for (const tenantId of tenantIds)
-            await worker.runBalanceDrift(tenantId, `scheduled-${new Date().toISOString()}-${randomUUID()}`);
+        for (const tenantId of tenantIds) {
+            try {
+                await worker.runBalanceDrift(tenantId, `scheduled-${new Date().toISOString()}-${randomUUID()}`);
+            }
+            catch (error) {
+                console.error(`Integrity check failed for tenant ${tenantId}`, error);
+            }
+        }
     }
     finally {
         running = false;
@@ -25,7 +31,7 @@ async function runChecks() {
 }
 await runChecks();
 const timer = setInterval(() => {
-    void runChecks();
+    void runChecks().catch((error) => console.error("Integrity cycle failed", error));
 }, config.LEDGER_INTEGRITY_INTERVAL_MS);
 process.on("SIGTERM", () => {
     clearInterval(timer);

@@ -7,6 +7,7 @@ import { ReversalService } from "../../src/services/reversal-service.js";
 import { AdjustmentService } from "../../src/services/adjustment-service.js";
 import { EventWorker } from "../../src/services/event-worker.js";
 import { IntegrityWorker } from "../../src/services/integrity-worker.js";
+import { BalanceQueryService } from "../../src/services/balance-query-service.js";
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const describeDatabase = databaseUrl === undefined ? describe.skip : describe;
 describeDatabase("synchronous double-entry posting", () => {
@@ -17,6 +18,7 @@ describeDatabase("synchronous double-entry posting", () => {
   let reversals: ReversalService;
   let adjustments: AdjustmentService;
   let integrity: IntegrityWorker;
+  let balances: BalanceQueryService;
   const tenantId = randomUUID();
   const entityId = randomUUID();
   const bookId = randomUUID();
@@ -33,6 +35,7 @@ describeDatabase("synchronous double-entry posting", () => {
       report: () => Promise.resolve(),
     });
     integrity = new IntegrityWorker(db, "test-integrity-worker");
+    balances = new BalanceQueryService(db);
     await db("ledger_entities").insert({
       id: entityId,
       tenant_id: tenantId,
@@ -318,6 +321,63 @@ describeDatabase("synchronous double-entry posting", () => {
       }),
     ).rejects.toMatchObject({ code: "CURRENCY_NOT_ENABLED" });
   });
+  it("resolves an authoritative currency-separated customer wallet balance", async () => {
+    const customerId = randomUUID();
+    const wallet = await accounts.provision({
+      tenantId,
+      ownerType: "CUSTOMER",
+      ownerId: customerId,
+      purpose: "WALLET",
+      accountType: "LIABILITY",
+      currency: "NGN",
+      idempotencyKey: randomUUID(),
+      sourceService: "parc-mobile-bff",
+      correlationId: randomUUID(),
+    });
+    await db("ledger_account_balances").insert({
+      tenant_id: tenantId,
+      account_id: wallet.account_id,
+      currency_code: "NGN",
+      posted_credit: "25000",
+      balance: "25000",
+      held_balance: "1500",
+      available_balance: "23500",
+      version: 2,
+    });
+    await expect(
+      balances.customerWallet({ tenantId, customerId, currency: "NGN" }),
+    ).resolves.toEqual({
+      account_id: wallet.account_id,
+      currency: "NGN",
+      posted_balance_minor: "25000",
+      held_balance_minor: "1500",
+      available_balance_minor: "23500",
+      version: 2,
+    });
+    await expect(
+      balances.customerWallet({
+        tenantId,
+        customerId: randomUUID(),
+        currency: "NGN",
+      }),
+    ).rejects.toMatchObject({ code: "CUSTOMER_WALLET_NOT_FOUND" });
+    await db("ledger_account_balances")
+      .where({ account_id: wallet.account_id })
+      .delete();
+    await db("ledger_outbox_events")
+      .where({ aggregate_id: wallet.account_id })
+      .delete();
+    await db("ledger_audit_logs")
+      .where({ entity_id: wallet.account_id })
+      .delete();
+    await db("customer_ledger_accounts")
+      .where({ ledger_account_id: wallet.account_id })
+      .delete();
+    await db("ledger_command_idempotency")
+      .where({ resource_id: wallet.account_id })
+      .delete();
+    await db("ledger_accounts").where({ id: wallet.account_id }).delete();
+  });
   it("reserves available balance exactly once, releases, captures atomically, and expires due holds", async () => {
     await db("accounting_periods").where({ tenant_id: tenantId }).delete();
     const makeHold = (amountMinor: string, key = randomUUID()) => ({
@@ -486,8 +546,15 @@ describeDatabase("synchronous double-entry posting", () => {
     });
     let publishedBody: Record<string, unknown> | undefined;
     const channel = {
-      publish: (_exchange: string, _key: string, body: Buffer) => {
+      publish: (
+        _exchange: string,
+        _key: string,
+        body: Buffer,
+        _options: unknown,
+        callback: (error: Error | null) => void,
+      ) => {
         publishedBody = JSON.parse(body.toString()) as Record<string, unknown>;
+        callback(null);
         return true;
       },
       waitForConfirms: () => Promise.resolve(),

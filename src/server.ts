@@ -8,6 +8,8 @@ import { HoldService } from "./services/hold-service.js";
 import { ReversalService } from "./services/reversal-service.js";
 import { AdjustmentService } from "./services/adjustment-service.js";
 import { TenantAdminApprovalGateway } from "./services/tenant-admin-approval-gateway.js";
+import { BalanceQueryService } from "./services/balance-query-service.js";
+import { CustomerStatementService } from "./services/customer-statement-service.js";
 const config = loadConfig();
 const database = createDatabase(config);
 const approvalGateway = new TenantAdminApprovalGateway(
@@ -30,6 +32,8 @@ const server = createServer(
       new PostingService(database),
       approvalGateway,
     ),
+    balances: new BalanceQueryService(database),
+    statements: new CustomerStatementService(database),
   }),
 );
 server.listen(config.PORT, config.HOST);
