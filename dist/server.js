@@ -8,6 +8,8 @@ import { HoldService } from "./services/hold-service.js";
 import { ReversalService } from "./services/reversal-service.js";
 import { AdjustmentService } from "./services/adjustment-service.js";
 import { TenantAdminApprovalGateway } from "./services/tenant-admin-approval-gateway.js";
+import { BalanceQueryService } from "./services/balance-query-service.js";
+import { CustomerStatementService } from "./services/customer-statement-service.js";
 const config = loadConfig();
 const database = createDatabase(config);
 const approvalGateway = new TenantAdminApprovalGateway(config.TENANT_ADMIN_URL, config.TENANT_ADMIN_SERVICE_TOKEN ?? config.INTERNAL_SERVICE_TOKEN);
@@ -18,9 +20,12 @@ const server = createServer(createApp({
     holds: new HoldService(database, new PostingService(database)),
     reversals: new ReversalService(database, new PostingService(database), approvalGateway),
     adjustments: new AdjustmentService(database, new PostingService(database), approvalGateway),
+    balances: new BalanceQueryService(database),
+    statements: new CustomerStatementService(database),
 }));
 server.listen(config.PORT, config.HOST);
 process.on("SIGTERM", () => {
-    server.close();
-    void database.destroy();
+    server.close(() => {
+        void database.destroy();
+    });
 });

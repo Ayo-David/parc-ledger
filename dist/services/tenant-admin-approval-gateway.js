@@ -6,10 +6,10 @@ export class TenantAdminApprovalGateway {
         this.token = token;
     }
     async consume(input) {
-        await this.call(`/internal/v1/approvals/${input.approvalId}/consume`, input.tenantId, input.idempotencyKey, input.binding);
+        await this.call(`/internal/v1/approvals/${encodeURIComponent(input.approvalId)}/consume`, input.tenantId, input.idempotencyKey, input.binding);
     }
     async report(input) {
-        await this.call(`/internal/v1/approvals/${input.approvalId}/execution`, input.tenantId, input.idempotencyKey, {
+        await this.call(`/internal/v1/approvals/${encodeURIComponent(input.approvalId)}/execution`, input.tenantId, input.idempotencyKey, {
             status: input.status,
             ...(input.result ? { result: input.result } : {}),
         });
@@ -25,6 +25,7 @@ export class TenantAdminApprovalGateway {
                 "idempotency-key": idempotencyKey,
             },
             body: JSON.stringify(body),
+            signal: AbortSignal.timeout(10_000),
         });
         if (!response.ok)
             throw new Error(`Tenant Admin approval request failed with ${response.status}`);

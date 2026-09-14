@@ -10,6 +10,8 @@ import type { AccountProvisioningService } from "./services/account-provisioning
 import type { HoldService } from "./services/hold-service.js";
 import type { ReversalService } from "./services/reversal-service.js";
 import type { AdjustmentService } from "./services/adjustment-service.js";
+import type { BalanceQueryService } from "./services/balance-query-service.js";
+import type { CustomerStatementService } from "./services/customer-statement-service.js";
 export function createApp(input: {
   config: AppConfig;
   postings: PostingService;
@@ -17,6 +19,8 @@ export function createApp(input: {
   holds: HoldService;
   reversals: ReversalService;
   adjustments: AdjustmentService;
+  balances: BalanceQueryService;
+  statements: CustomerStatementService;
 }): Express {
   const app = express();
   app.disable("x-powered-by");
@@ -37,8 +41,8 @@ export function createApp(input: {
       );
       const tenantId = req.header("x-tenant-id");
       const idempotencyKey = req.header("idempotency-key");
-      const sourceService = input.config.SERVICE_NAME;
-      if (!tenantId || !idempotencyKey)
+      const sourceService = req.header("x-calling-service");
+      if (!tenantId || !idempotencyKey || !sourceService)
         throw new PostingError(
           "REQUEST_INVALID",
           "Tenant, idempotency key, and calling service are required",
@@ -83,8 +87,8 @@ export function createApp(input: {
       );
       const tenantId = req.header("x-tenant-id"),
         idempotencyKey = req.header("idempotency-key"),
-        sourceService = input.config.SERVICE_NAME;
-      if (!tenantId || !idempotencyKey)
+        sourceService = req.header("x-calling-service");
+      if (!tenantId || !idempotencyKey || !sourceService)
         throw new PostingError(
           "REQUEST_INVALID",
           "Tenant, idempotency key, and calling service are required",
@@ -127,13 +131,103 @@ export function createApp(input: {
       next(error);
     }
   });
-  app.post("/internal/v1/holds", async (req, res, next) => {
+  app.get("/internal/v1/accounts/:id/balance", async (req, res, next) => {
     try {
-      const context = internalContext(
+      const context = internalReadContext(
         req,
         input.config.INTERNAL_SERVICE_TOKEN,
-        input.config.SERVICE_NAME,
       );
+      res.json(
+        await input.balances.byAccount({
+          tenantId: context.tenantId,
+          accountId: req.params.id,
+        }),
+      );
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.get(
+    "/internal/v1/customers/:customerId/wallet-balance",
+    async (req, res, next) => {
+      try {
+        const context = internalReadContext(
+          req,
+          input.config.INTERNAL_SERVICE_TOKEN,
+        );
+        res.json(
+          await input.balances.customerWallet({
+            tenantId: context.tenantId,
+            customerId: req.params.customerId,
+            currency:
+              typeof req.query.currency === "string" ? req.query.currency : "",
+          }),
+        );
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+  app.post(
+    "/internal/v1/customers/:customerId/statements",
+    async (req, res, next) => {
+      try {
+        const context = internalContext(
+          req,
+          input.config.INTERNAL_SERVICE_TOKEN,
+        );
+        const body = req.body as Record<string, unknown>;
+        if (
+          typeof body.date_from !== "string" ||
+          typeof body.date_to !== "string" ||
+          body.format !== "pdf" ||
+          (body.currency !== undefined && typeof body.currency !== "string")
+        )
+          throw new PostingError(
+            "REQUEST_INVALID",
+            "Invalid statement request",
+          );
+        const result = await input.statements.request({
+          tenantId: context.tenantId,
+          customerId: req.params.customerId,
+          currency: body.currency ?? "NGN",
+          dateFrom: body.date_from,
+          dateTo: body.date_to,
+          format: "PDF",
+          idempotencyKey: context.idempotencyKey,
+        });
+        res
+          .status(result.replayed ? 200 : 202)
+          .setHeader("Idempotent-Replayed", String(result.replayed))
+          .json(result);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+  app.get(
+    "/internal/v1/customers/:customerId/statements/:statementId",
+    async (req, res, next) => {
+      try {
+        const context = internalReadContext(
+          req,
+          input.config.INTERNAL_SERVICE_TOKEN,
+        );
+        res.json(
+          await input.statements.get({
+            tenantId: context.tenantId,
+            customerId: req.params.customerId,
+            statementId: req.params.statementId,
+          }),
+        );
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+  app.post("/internal/v1/holds", async (req, res, next) => {
+    try {
+      const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
       const body = req.body as Record<string, unknown>;
       if (
         ![
@@ -153,7 +247,7 @@ export function createApp(input: {
         purpose: String(body.purpose),
         expiresAt: String(body.expires_at),
         idempotencyKey: context.idempotencyKey,
-        sourceService: input.config.SERVICE_NAME,
+        sourceService: context.sourceService,
         correlationId: context.correlationId,
       });
       res
@@ -166,11 +260,7 @@ export function createApp(input: {
   });
   app.post("/internal/v1/holds/:id/release", async (req, res, next) => {
     try {
-      const context = internalContext(
-        req,
-        input.config.INTERNAL_SERVICE_TOKEN,
-        input.config.SERVICE_NAME,
-      );
+      const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
       const body = req.body as { reason?: unknown };
       if (body.reason !== undefined && typeof body.reason !== "string")
         throw new PostingError("REQUEST_INVALID", "Release reason is invalid");
@@ -190,11 +280,7 @@ export function createApp(input: {
   });
   app.post("/internal/v1/holds/:id/capture", async (req, res, next) => {
     try {
-      const context = internalContext(
-        req,
-        input.config.INTERNAL_SERVICE_TOKEN,
-        input.config.SERVICE_NAME,
-      );
+      const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
       const body = req.body as {
         reference?: unknown;
         entries?: Array<{
@@ -232,7 +318,6 @@ export function createApp(input: {
         const context = internalContext(
           req,
           input.config.INTERNAL_SERVICE_TOKEN,
-          input.config.SERVICE_NAME,
         );
         const body = req.body as {
           reason?: unknown;
@@ -257,6 +342,9 @@ export function createApp(input: {
           ...(body.approval_id === undefined
             ? {}
             : { approvalId: body.approval_id }),
+          ...(body.automated_rule_id === undefined
+            ? {}
+            : { automatedRuleId: body.automated_rule_id }),
         });
         res
           .status(result.replayed ? 200 : 201)
@@ -269,11 +357,7 @@ export function createApp(input: {
   );
   app.post("/internal/v1/manual-adjustments", async (req, res, next) => {
     try {
-      const context = internalContext(
-        req,
-        input.config.INTERNAL_SERVICE_TOKEN,
-        input.config.SERVICE_NAME,
-      );
+      const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
       const body = req.body as {
         approval_id?: unknown;
         reference?: unknown;
@@ -304,7 +388,7 @@ export function createApp(input: {
         reason: body.reason,
         entries: mapEntries(body.entries),
         idempotencyKey: context.idempotencyKey,
-        sourceService: input.config.SERVICE_NAME,
+        sourceService: context.sourceService,
         correlationId: context.correlationId,
       });
       res
@@ -328,11 +412,13 @@ export function createApp(input: {
         .status(
           error instanceof PostingError && error.code === "UNAUTHORIZED"
             ? 401
-            : error instanceof PostingError && error.code.includes("INVALID")
-              ? 422
-              : error instanceof PostingError
-                ? 409
-                : 500,
+            : error instanceof PostingError && error.code.endsWith("NOT_FOUND")
+              ? 404
+              : error instanceof PostingError && error.code.includes("INVALID")
+                ? 422
+                : error instanceof PostingError
+                  ? 409
+                  : 500,
         )
         .json({
           code: known ? error.code : "INTERNAL_ERROR",
@@ -341,6 +427,20 @@ export function createApp(input: {
     },
   );
   return app;
+}
+function internalReadContext(
+  req: express.Request,
+  expectedToken: string,
+): { tenantId: string; sourceService: string } {
+  authenticate(req.header("x-internal-service-token") ?? "", expectedToken);
+  const tenantId = req.header("x-tenant-id");
+  const sourceService = req.header("x-calling-service");
+  if (!tenantId || !sourceService)
+    throw new PostingError(
+      "REQUEST_INVALID",
+      "Tenant and calling service are required",
+    );
+  return { tenantId, sourceService };
 }
 function authenticate(token: string, expected: string): void {
   if (
@@ -355,7 +455,6 @@ function authenticate(token: string, expected: string): void {
 function internalContext(
   req: express.Request,
   expectedToken: string,
-  sourceService: string,
 ): {
   tenantId: string;
   idempotencyKey: string;
@@ -364,8 +463,9 @@ function internalContext(
 } {
   authenticate(req.header("x-internal-service-token") ?? "", expectedToken);
   const tenantId = req.header("x-tenant-id"),
-    idempotencyKey = req.header("idempotency-key");
-  if (!tenantId || !idempotencyKey)
+    idempotencyKey = req.header("idempotency-key"),
+    sourceService = req.header("x-calling-service");
+  if (!tenantId || !idempotencyKey || !sourceService)
     throw new PostingError(
       "REQUEST_INVALID",
       "Tenant, idempotency key, and calling service are required",
