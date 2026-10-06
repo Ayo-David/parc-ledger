@@ -219,8 +219,9 @@ jobs:
               --network host \
               -e NODE_ENV \
               -e DATABASE_URL \
+              -e KNEX_MIGRATIONS_COMPILED=true \
               "$IMAGE_URI" \
-              yarn migrate:runtime
+              node ./node_modules/knex/bin/cli.js --knexfile dist/knexfile.js migrate:latest
 
             # --- STEP 2: SWAP APPLICATION CONTAINERS ---
             echo "Replacing application containers..."
@@ -231,6 +232,10 @@ jobs:
             echo "Waiting for the new containers to report ready..."
             if wait_until_ready; then
               echo "$IMAGE_URI" > "$STATE_DIR/current_image.txt"
+              # Ordered deploy history lets repeated rollbacks step back one image at a time.
+              echo "$IMAGE_URI" >> "$STATE_DIR/image_history.txt"
+              tail -n 50 "$STATE_DIR/image_history.txt" > "$STATE_DIR/image_history.tmp"
+              mv "$STATE_DIR/image_history.tmp" "$STATE_DIR/image_history.txt"
               echo "Deploy succeeded: $IMAGE_URI"
               docker image prune -af --filter "until=72h"
             else

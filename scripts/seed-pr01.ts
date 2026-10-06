@@ -35,6 +35,20 @@ const fixtures = [
 try {
   await database.transaction(async (transaction) => {
     for (const fixture of fixtures) {
+      // Fixture IDs are fixed; refuse to update rows owned by another tenant.
+      for (const [table, id] of [
+        ["ledger_entities", fixture.entityId],
+        ["ledger_books", fixture.bookId],
+      ] as const) {
+        const existing = await transaction(table)
+          .where({ id })
+          .first<{ tenant_id: string } | undefined>("tenant_id");
+        if (existing && existing.tenant_id !== fixture.tenantId)
+          throw new Error(
+            `${table} fixture ${id} belongs to a different tenant than ${fixture.code}`,
+          );
+      }
+
       await transaction("ledger_entities")
         .insert({
           id: fixture.entityId,

@@ -141,6 +141,17 @@ jobs:
 
             if wait_until_ready; then
               echo "$IMAGE_URI" > "$STATE_DIR/current_image.txt"
+              # Advance the default target to the image deployed before this one, so a
+              # further rollback steps back again instead of redeploying the same image.
+              OLDER_IMAGE=""
+              if [ -f "$STATE_DIR/image_history.txt" ]; then
+                OLDER_IMAGE=$(awk -v target="$IMAGE_URI" '$0 == target { found = prev } $0 != target { prev = $0 } END { print found }' "$STATE_DIR/image_history.txt")
+              fi
+              if [ -n "$OLDER_IMAGE" ]; then
+                echo "$OLDER_IMAGE" > "$STATE_DIR/previous_image.txt"
+              else
+                rm -f "$STATE_DIR/previous_image.txt"
+              fi
               echo "Rollback succeeded: $IMAGE_URI"
             else
               echo "Rollback containers failed readiness checks." >&2

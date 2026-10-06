@@ -5,6 +5,7 @@ export class TenantAdminApprovalGateway implements ApprovalGateway {
   public constructor(
     private readonly url: string,
     private readonly tokens: Pick<ParcTokenClient, "authorization">,
+    private readonly serviceName: string,
   ) {}
   public async consume(input: {
     tenantId: string;
@@ -52,7 +53,7 @@ export class TenantAdminApprovalGateway implements ApprovalGateway {
           scopes: ["tenant.approvals.consume"],
           tenantId,
         }),
-        "x-calling-service": "parc-ledger",
+        "x-calling-service": this.serviceName,
         "x-tenant-id": tenantId,
         "idempotency-key": idempotencyKey,
       },

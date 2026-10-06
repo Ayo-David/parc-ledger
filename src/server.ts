@@ -26,6 +26,7 @@ const tokens = await ParcTokenClient.fromBase64Key({
 const approvalGateway = new TenantAdminApprovalGateway(
   config.TENANT_ADMIN_URL,
   tokens,
+  config.SERVICE_NAME,
 );
 const server = createServer(
   createApp({
