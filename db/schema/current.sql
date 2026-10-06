@@ -706,11 +706,6 @@ BEGIN
             v_credits;
     END IF;
 
-    UPDATE journals
-    SET
-        total_debits = v_debits,
-        total_credits = v_credits
-    WHERE id = p_journal_id;
 END;
 $$;
 
@@ -4472,4 +4467,3 @@ CREATE POLICY transaction_reversals_policy ON public.transaction_reversals USING
 --
 -- PostgreSQL database dump complete
 --
-

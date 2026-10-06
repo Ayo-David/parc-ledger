@@ -183,6 +183,13 @@ describeDatabase("synchronous double-entry posting", () => {
         .where({ account_id: debitId })
         .first(),
     ).toMatchObject({ balance: "12500", available_balance: "12500" });
+    expect(
+      await db("journals").where({ id: first.journal_id }).first(),
+    ).toMatchObject({
+      status: "POSTED",
+      total_debits: "12500",
+      total_credits: "12500",
+    });
     await expect(
       db("journal_entries").insert({
         tenant_id: tenantId,
