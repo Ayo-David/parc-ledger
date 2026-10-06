@@ -1,4 +1,3 @@
-import { timingSafeEqual } from "node:crypto";
 import express, { type Express } from "express";
 import helmet from "helmet";
 import type { AppConfig } from "./config/env.js";
@@ -12,8 +11,82 @@ import type { ReversalService } from "./services/reversal-service.js";
 import type { AdjustmentService } from "./services/adjustment-service.js";
 import type { BalanceQueryService } from "./services/balance-query-service.js";
 import type { CustomerStatementService } from "./services/customer-statement-service.js";
+import {
+  principalOf,
+  type AccessPolicy,
+} from "./security/parc-service-auth.js";
+
+/** Inbound Auth-issued token validation (see parc-service-auth). */
+export interface LedgerAccess {
+  require(policy: AccessPolicy): express.RequestHandler;
+}
+
+const postingServices = ["parc-lending", "parc-payment", "parc-savings"];
+
+/** Ledger endpoint permissions; the caller is derived from the token. */
+export const ledgerAccessPolicies = {
+  postings: { scopes: ["ledger.postings.write"], actors: postingServices },
+  accounts: {
+    scopes: ["ledger.accounts.provision"],
+    actors: ["parc-payment", "parc-savings"],
+  },
+  accountBalance: {
+    scopes: ["ledger.balances.read"],
+    actors: ["parc-admin-bff", "parc-payment", "parc-savings"],
+  },
+  walletBalance: {
+    scopes: ["ledger.balances.read"],
+    actors: [
+      "parc-admin-bff",
+      "parc-mobile-bff",
+      "parc-payment",
+      "parc-savings",
+    ],
+  },
+  statements: {
+    scopes: ["ledger.statements"],
+    kinds: ["delegated"],
+    subjectTypes: ["CUSTOMER"],
+    actors: ["parc-mobile-bff"],
+  },
+  reversals: {
+    scopes: ["ledger.reversals.write"],
+    actors: ["parc-lending", "parc-payment"],
+  },
+  adjustments: {
+    scopes: ["ledger.adjustments.write"],
+    kinds: ["delegated"],
+    subjectTypes: ["ADMINISTRATOR"],
+    actors: ["parc-admin-bff"],
+  },
+} satisfies Record<string, AccessPolicy>;
+
+const ledgerRoutePolicies: ReadonlyArray<
+  [
+    method: "get" | "post",
+    path: string,
+    policy: keyof typeof ledgerAccessPolicies,
+  ]
+> = [
+  ["post", "/internal/v1/postings", "postings"],
+  ["post", "/internal/v1/accounts", "accounts"],
+  ["get", "/internal/v1/accounts/:id/balance", "accountBalance"],
+  ["get", "/internal/v1/customers/:customerId/wallet-balance", "walletBalance"],
+  ["post", "/internal/v1/customers/:customerId/statements", "statements"],
+  [
+    "get",
+    "/internal/v1/customers/:customerId/statements/:statementId",
+    "statements",
+  ],
+  ["post", "/internal/v1/holds", "postings"],
+  ["post", "/internal/v1/holds/:id/release", "postings"],
+  ["post", "/internal/v1/holds/:id/capture", "postings"],
+  ["post", "/internal/v1/transactions/:id/reversals", "reversals"],
+  ["post", "/internal/v1/manual-adjustments", "adjustments"],
+];
 export function createApp(input: {
   config: AppConfig;
+  access: LedgerAccess;
   postings: PostingService;
   accounts: AccountProvisioningService;
   holds: HoldService;
@@ -23,6 +96,9 @@ export function createApp(input: {
   statements: CustomerStatementService;
 }): Express {
   const app = express();
+  // Endpoint permissions run before each route handler.
+  for (const [method, path, name] of ledgerRoutePolicies)
+    app[method](path, input.access.require(ledgerAccessPolicies[name]));
   app.disable("x-powered-by");
   app.use(helmet());
   app.use(express.json({ limit: "128kb" }));
@@ -35,13 +111,8 @@ export function createApp(input: {
   );
   app.post("/internal/v1/postings", async (req, res, next) => {
     try {
-      authenticate(
-        req.header("x-internal-service-token") ?? "",
-        input.config.INTERNAL_SERVICE_TOKEN,
-      );
-      const tenantId = req.header("x-tenant-id");
+      const { tenantId, sourceService } = caller(req);
       const idempotencyKey = req.header("idempotency-key");
-      const sourceService = req.header("x-calling-service");
       if (!tenantId || !idempotencyKey || !sourceService)
         throw new PostingError(
           "REQUEST_INVALID",
@@ -81,13 +152,8 @@ export function createApp(input: {
   });
   app.post("/internal/v1/accounts", async (req, res, next) => {
     try {
-      authenticate(
-        req.header("x-internal-service-token") ?? "",
-        input.config.INTERNAL_SERVICE_TOKEN,
-      );
-      const tenantId = req.header("x-tenant-id"),
-        idempotencyKey = req.header("idempotency-key"),
-        sourceService = req.header("x-calling-service");
+      const { tenantId, sourceService } = caller(req),
+        idempotencyKey = req.header("idempotency-key");
       if (!tenantId || !idempotencyKey || !sourceService)
         throw new PostingError(
           "REQUEST_INVALID",
@@ -133,10 +199,7 @@ export function createApp(input: {
   });
   app.get("/internal/v1/accounts/:id/balance", async (req, res, next) => {
     try {
-      const context = internalReadContext(
-        req,
-        input.config.INTERNAL_SERVICE_TOKEN,
-      );
+      const context = internalReadContext(req);
       res.json(
         await input.balances.byAccount({
           tenantId: context.tenantId,
@@ -151,10 +214,7 @@ export function createApp(input: {
     "/internal/v1/customers/:customerId/wallet-balance",
     async (req, res, next) => {
       try {
-        const context = internalReadContext(
-          req,
-          input.config.INTERNAL_SERVICE_TOKEN,
-        );
+        const context = internalReadContext(req);
         res.json(
           await input.balances.customerWallet({
             tenantId: context.tenantId,
@@ -172,10 +232,7 @@ export function createApp(input: {
     "/internal/v1/customers/:customerId/statements",
     async (req, res, next) => {
       try {
-        const context = internalContext(
-          req,
-          input.config.INTERNAL_SERVICE_TOKEN,
-        );
+        const context = internalContext(req);
         const body = req.body as Record<string, unknown>;
         if (
           typeof body.date_from !== "string" ||
@@ -209,10 +266,7 @@ export function createApp(input: {
     "/internal/v1/customers/:customerId/statements/:statementId",
     async (req, res, next) => {
       try {
-        const context = internalReadContext(
-          req,
-          input.config.INTERNAL_SERVICE_TOKEN,
-        );
+        const context = internalReadContext(req);
         res.json(
           await input.statements.get({
             tenantId: context.tenantId,
@@ -227,7 +281,7 @@ export function createApp(input: {
   );
   app.post("/internal/v1/holds", async (req, res, next) => {
     try {
-      const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
+      const context = internalContext(req);
       const body = req.body as Record<string, unknown>;
       if (
         ![
@@ -260,7 +314,7 @@ export function createApp(input: {
   });
   app.post("/internal/v1/holds/:id/release", async (req, res, next) => {
     try {
-      const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
+      const context = internalContext(req);
       const body = req.body as { reason?: unknown };
       if (body.reason !== undefined && typeof body.reason !== "string")
         throw new PostingError("REQUEST_INVALID", "Release reason is invalid");
@@ -280,7 +334,7 @@ export function createApp(input: {
   });
   app.post("/internal/v1/holds/:id/capture", async (req, res, next) => {
     try {
-      const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
+      const context = internalContext(req);
       const body = req.body as {
         reference?: unknown;
         entries?: Array<{
@@ -315,10 +369,7 @@ export function createApp(input: {
     "/internal/v1/transactions/:id/reversals",
     async (req, res, next) => {
       try {
-        const context = internalContext(
-          req,
-          input.config.INTERNAL_SERVICE_TOKEN,
-        );
+        const context = internalContext(req);
         const body = req.body as {
           reason?: unknown;
           approval_id?: unknown;
@@ -357,7 +408,7 @@ export function createApp(input: {
   );
   app.post("/internal/v1/manual-adjustments", async (req, res, next) => {
     try {
-      const context = internalContext(req, input.config.INTERNAL_SERVICE_TOKEN);
+      const context = internalContext(req);
       const body = req.body as {
         approval_id?: unknown;
         reference?: unknown;
@@ -412,13 +463,17 @@ export function createApp(input: {
         .status(
           error instanceof PostingError && error.code === "UNAUTHORIZED"
             ? 401
-            : error instanceof PostingError && error.code.endsWith("NOT_FOUND")
-              ? 404
-              : error instanceof PostingError && error.code.includes("INVALID")
-                ? 422
-                : error instanceof PostingError
-                  ? 409
-                  : 500,
+            : error instanceof PostingError && error.code.endsWith("FORBIDDEN")
+              ? 403
+              : error instanceof PostingError &&
+                  error.code.endsWith("NOT_FOUND")
+                ? 404
+                : error instanceof PostingError &&
+                    error.code.includes("INVALID")
+                  ? 422
+                  : error instanceof PostingError
+                    ? 409
+                    : 500,
         )
         .json({
           code: known ? error.code : "INTERNAL_ERROR",
@@ -428,48 +483,60 @@ export function createApp(input: {
   );
   return app;
 }
-function internalReadContext(
-  req: express.Request,
-  expectedToken: string,
-): { tenantId: string; sourceService: string } {
-  authenticate(req.header("x-internal-service-token") ?? "", expectedToken);
-  const tenantId = req.header("x-tenant-id");
-  const sourceService = req.header("x-calling-service");
+/**
+ * Tenant and calling service from the validated token. The middleware has
+ * checked X-Tenant-Id and X-Calling-Service against the token; the header is
+ * still required by the contract.
+ */
+function caller(req: express.Request): {
+  tenantId: string | undefined;
+  sourceService: string | undefined;
+} {
+  const principal = principalOf(req);
+  return {
+    tenantId: req.header("x-tenant-id") ?? undefined,
+    sourceService: req.header("x-calling-service")
+      ? principal.client
+      : undefined,
+  };
+}
+
+/** A customer delegation may only reach that customer's own resources. */
+function assertCustomerScope(req: express.Request, customerId: string): void {
+  const subject = principalOf(req).subject;
+  if (subject?.type === "CUSTOMER" && subject.id !== customerId)
+    throw new PostingError("SUBJECT_FORBIDDEN", "Customer mismatch");
+}
+
+function internalReadContext(req: express.Request): {
+  tenantId: string;
+  sourceService: string;
+} {
+  const { tenantId, sourceService } = caller(req);
   if (!tenantId || !sourceService)
     throw new PostingError(
       "REQUEST_INVALID",
       "Tenant and calling service are required",
     );
+  if (typeof req.params.customerId === "string")
+    assertCustomerScope(req, req.params.customerId);
   return { tenantId, sourceService };
 }
-function authenticate(token: string, expected: string): void {
-  if (
-    Buffer.byteLength(token) !== Buffer.byteLength(expected) ||
-    !timingSafeEqual(Buffer.from(token), Buffer.from(expected))
-  )
-    throw new PostingError(
-      "UNAUTHORIZED",
-      "Internal service authentication required",
-    );
-}
-function internalContext(
-  req: express.Request,
-  expectedToken: string,
-): {
+function internalContext(req: express.Request): {
   tenantId: string;
   idempotencyKey: string;
   sourceService: string;
   correlationId: string;
 } {
-  authenticate(req.header("x-internal-service-token") ?? "", expectedToken);
-  const tenantId = req.header("x-tenant-id"),
-    idempotencyKey = req.header("idempotency-key"),
-    sourceService = req.header("x-calling-service");
+  const { tenantId, sourceService } = caller(req),
+    idempotencyKey = req.header("idempotency-key");
   if (!tenantId || !idempotencyKey || !sourceService)
     throw new PostingError(
       "REQUEST_INVALID",
       "Tenant, idempotency key, and calling service are required",
     );
+  if (typeof req.params.customerId === "string")
+    assertCustomerScope(req, req.params.customerId);
   return {
     tenantId,
     idempotencyKey,

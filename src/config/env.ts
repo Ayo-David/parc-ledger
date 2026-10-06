@@ -7,9 +7,18 @@ const schema = z
     PORT: z.coerce.number().int().positive().default(3003),
     HOST: z.string().default("0.0.0.0"),
     DATABASE_URL: z.string().optional(),
-    INTERNAL_SERVICE_TOKEN: z.string().min(24),
+    AUTH_JWKS_URL: z
+      .string()
+      .url()
+      .default("http://127.0.0.1:3001/.well-known/jwks.json"),
+    AUTH_JWT_ISSUER: z.string().url().default("https://auth.parc.invalid"),
+    AUTH_TOKEN_URL: z
+      .string()
+      .url()
+      .default("http://127.0.0.1:3001/internal/v1/oauth/token"),
+    SERVICE_CLIENT_KEY_ID: z.string().min(1),
+    SERVICE_CLIENT_PRIVATE_KEY_BASE64: z.string().min(1),
     TENANT_ADMIN_URL: z.string().url().default("http://127.0.0.1:3002"),
-    TENANT_ADMIN_SERVICE_TOKEN: z.string().min(24).optional(),
     AMQP_URL: z.string().url().optional(),
     LEDGER_INBOUND_ROUTING_KEYS: z
       .string()
@@ -37,7 +46,9 @@ const schema = z
   }));
 export type AppConfig = z.infer<typeof schema>;
 export function loadConfig(
-  overrides: Partial<Record<keyof AppConfig, string | number>> = {},
+  overrides: Partial<
+    Record<keyof z.input<typeof schema>, string | number>
+  > = {},
 ): AppConfig {
   return schema.parse({ ...process.env, ...overrides });
 }

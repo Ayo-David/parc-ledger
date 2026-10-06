@@ -1,9 +1,10 @@
+import type { ParcTokenClient } from "../security/parc-service-auth.js";
 import type { ApprovalGateway } from "./adjustment-service.js";
 
 export class TenantAdminApprovalGateway implements ApprovalGateway {
   public constructor(
     private readonly url: string,
-    private readonly token: string,
+    private readonly tokens: Pick<ParcTokenClient, "authorization">,
   ) {}
   public async consume(input: {
     tenantId: string;
@@ -45,8 +46,13 @@ export class TenantAdminApprovalGateway implements ApprovalGateway {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-service-token": this.token,
-        "x-service-name": "parc-ledger",
+        // Delegated while serving an administrator's adjustment or reversal.
+        authorization: await this.tokens.authorization({
+          audience: "parc-tenant-admin",
+          scopes: ["tenant.approvals.consume"],
+          tenantId,
+        }),
+        "x-calling-service": "parc-ledger",
         "x-tenant-id": tenantId,
         "idempotency-key": idempotencyKey,
       },

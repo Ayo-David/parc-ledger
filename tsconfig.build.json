@@ -1,5 +1,4 @@
 {
   "extends": "./tsconfig.json",
-  "compilerOptions": { "rootDir": "src" },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "db/migrations/**/*.ts", "knexfile.ts"]
 }
