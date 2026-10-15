@@ -1,7 +1,16 @@
 import type { ConfirmChannel } from "amqplib";
 import { createHash } from "node:crypto";
 import type { Knex } from "knex";
+import { z } from "zod";
 import { withTenantTransaction } from "../database/client.js";
+import type { AccountProvisioningService } from "./account-provisioning-service.js";
+
+/** Published by Auth once a customer finishes onboarding. */
+export const CUSTOMER_ONBOARDING_COMPLETED = "customer.onboarding.completed.v1";
+
+const onboardingCompletedPayload = z.object({
+  customer_id: z.string().uuid(),
+});
 
 type OutboxEvent = {
   id: string;
@@ -21,6 +30,7 @@ export class EventWorker {
   public constructor(
     private readonly db: Knex,
     private readonly workerId: string,
+    private readonly accounts?: AccountProvisioningService,
   ) {}
 
   public async publishOne(
@@ -89,6 +99,52 @@ export class EventWorker {
       ]);
       return false;
     }
+  }
+
+  /**
+   * Acts on an event already recorded by `receive`. Runs on every delivery,
+   * duplicates included: provisioning is idempotent per customer, so a
+   * redelivery after a crash between provisioning and the PROCESSED update
+   * still converges instead of being dropped.
+   */
+  public async dispatch(input: {
+    tenantId: string;
+    sourceService: string;
+    eventId: string;
+    eventType: string;
+    payload: object;
+    correlationId?: string;
+  }): Promise<void> {
+    if (
+      !this.accounts ||
+      input.eventType !== CUSTOMER_ONBOARDING_COMPLETED ||
+      input.sourceService !== "parc-auth-customer"
+    )
+      return;
+    const { customer_id: customerId } = onboardingCompletedPayload.parse(
+      input.payload,
+    );
+    await this.accounts.provision({
+      tenantId: input.tenantId,
+      ownerType: "CUSTOMER",
+      ownerId: customerId,
+      purpose: "WALLET",
+      accountType: "LIABILITY",
+      currency: "NGN",
+      idempotencyKey: `customer-wallet:${customerId}:NGN`,
+      sourceService: input.sourceService,
+      correlationId: input.correlationId ?? input.eventId,
+    });
+    await withTenantTransaction(this.db, input.tenantId, (tx) =>
+      tx("ledger_inbox_events")
+        .where({ source_service: input.sourceService, event_id: input.eventId })
+        .whereNot({ status: "PROCESSED" })
+        .update({
+          status: "PROCESSED",
+          processed_at: tx.fn.now(),
+          processed_by: this.workerId,
+        }),
+    );
   }
 
   public async receive(input: {

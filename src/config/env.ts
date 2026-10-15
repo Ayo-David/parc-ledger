@@ -22,7 +22,9 @@ const schema = z
     AMQP_URL: z.string().url().optional(),
     LEDGER_INBOUND_ROUTING_KEYS: z
       .string()
-      .default("tenant.configuration-changed.v1"),
+      .default(
+        "tenant.configuration-changed.v1,customer.onboarding.completed.v1",
+      ),
     LEDGER_INTEGRITY_TENANT_IDS: z.string().default(""),
     LEDGER_INTEGRITY_INTERVAL_MS: z.coerce
       .number()
