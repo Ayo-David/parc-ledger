@@ -1,6 +1,7 @@
 import amqp from "amqplib";
 import { loadConfig } from "./config/env.js";
 import { createDatabase } from "./database/client.js";
+import { AccountProvisioningService } from "./services/account-provisioning-service.js";
 import { EventWorker } from "./services/event-worker.js";
 
 const config = loadConfig();
@@ -10,6 +11,7 @@ const database = createDatabase(config);
 const worker = new EventWorker(
   database,
   `${config.SERVICE_NAME}-${process.pid}`,
+  new AccountProvisioningService(database),
 );
 let publishing = false;
 async function shutdown(exitCode = 0): Promise<void> {
@@ -69,6 +71,10 @@ async function handle(message: amqp.ConsumeMessage | null): Promise<void> {
       correlation_id?: string;
       causation_id?: string;
     };
+    const correlation =
+      event.correlation_id === undefined
+        ? {}
+        : { correlationId: event.correlation_id };
     await worker.receive({
       tenantId: event.tenant_id,
       sourceService: event.producer,
@@ -77,15 +83,26 @@ async function handle(message: amqp.ConsumeMessage | null): Promise<void> {
       eventVersion: event.event_version,
       payload: event.payload,
       idempotencyKey: event.idempotency_key,
-      ...(event.correlation_id === undefined
-        ? {}
-        : { correlationId: event.correlation_id }),
+      ...correlation,
       ...(event.causation_id === undefined
         ? {}
         : { causationId: event.causation_id }),
     });
+    await worker.dispatch({
+      tenantId: event.tenant_id,
+      sourceService: event.producer,
+      eventId: event.event_id,
+      eventType: event.event_type,
+      payload: event.payload,
+      ...correlation,
+    });
     channel.ack(message);
-  } catch {
+  } catch (error) {
+    console.error("Inbound event handling failed", {
+      messageId: message.properties.messageId as unknown,
+      routingKey: message.fields.routingKey,
+      error: error instanceof Error ? error.message : String(error),
+    });
     channel.nack(message, false, false);
   }
 }

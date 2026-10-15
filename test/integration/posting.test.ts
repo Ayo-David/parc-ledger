@@ -589,6 +589,48 @@ describeDatabase("synchronous double-entry posting", () => {
     expect(await worker.receive(inbound)).toBe(true);
     expect(await worker.receive(inbound)).toBe(false);
   });
+  it("provisions a customer wallet from the onboarding-completed event, idempotently", async () => {
+    const worker = new EventWorker(db, "test-worker", accounts);
+    const customerId = randomUUID();
+    const event = {
+      tenantId,
+      sourceService: "parc-auth-customer",
+      eventId: randomUUID(),
+      eventType: "customer.onboarding.completed.v1",
+      eventVersion: 1,
+      payload: { customer_id: customerId },
+    };
+    expect(await worker.receive(event)).toBe(true);
+    await worker.dispatch(event);
+    await worker.dispatch(event);
+    const wallets = await db("customer_ledger_accounts").where({
+      tenant_id: tenantId,
+      customer_id: customerId,
+      account_purpose: "WALLET",
+    });
+    expect(wallets).toHaveLength(1);
+    expect(
+      await balances.customerWallet({ tenantId, customerId, currency: "NGN" }),
+    ).toMatchObject({ available_balance_minor: "0" });
+    expect(
+      await db("ledger_inbox_events")
+        .where({ event_id: event.eventId })
+        .first(),
+    ).toMatchObject({ status: "PROCESSED" });
+    const otherCustomerId = randomUUID();
+    await worker.dispatch({
+      ...event,
+      eventId: randomUUID(),
+      sourceService: "parc-payment",
+      payload: { customer_id: otherCustomerId },
+    });
+    expect(
+      await db("customer_ledger_accounts").where({
+        tenant_id: tenantId,
+        customer_id: otherCustomerId,
+      }),
+    ).toHaveLength(0);
+  });
   it("records balance drift and reconciliation exceptions without changing journals", async () => {
     await db("ledger_account_balances")
       .where({ account_id: debitId })
